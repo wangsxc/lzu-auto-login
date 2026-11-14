@@ -4,10 +4,12 @@
   "domain": "@study",
   "portal_host": "10.10.0.166",
   "ac_id": "2",
-  "target_ssids": ["LZU", "iLZU"],
-  "check_interval": 60,
-  "login_cooldown": 1800,
-  "online_probe": true,
+  "target_ssids": [],
+  "ssid_filter": false,
+  "check_interval": 1800,
+  "retry_backoff": [300, 900, 3600],
+  "state_file": ".lzu_state.json",
+  "lock_port": 47621,
   "log_file": "lzu_auto_login.log",
-  "_说明": "复制本文件为 config.json 后填写。config.json 已被 .gitignore 排除；可用环境变量 LZU_USERNAME / LZU_PASSWORD 覆盖账密，用 LZU_CONFIG 指定其他配置文件（测试环境由 tests/run_mock_test.py 自动设为 config.test.json）。domain 填 @study 对应 @eLearning（流量不限，断线或路由器重启后需重新认证）；填空字符串对应 @lzu.edu.cn（有记忆但流量有限）。target_ssids 留空数组表示不限制 SSID。online_probe 设为 false 时跳过外网探活，仅用于本地 mock 测试。"
+  "_说明": "复制本文件为 config.json 后填写。config.json 已被 .gitignore 排除；可用环境变量 LZU_USERNAME / LZU_PASSWORD 覆盖账密，用 LZU_CONFIG 指定其他配置文件（测试由 tests/run_mock_test.py 自动设为 config.test.json）。domain 填 @study 对应 @eLearning（流量不限，断电或长时间离线后需重新认证）；填空字符串对应 @lzu.edu.cn（有记忆但流量有限）。脚本默认单次运行（--once）：已认证只查一次 rad_user_info 就退出，未认证才登录。ssid_filter 默认 false，不按 WiFi 名过滤；check_interval 仅用于 --watch 调试；retry_backoff 是连续失败后的退避秒数。生产请用启动项 / 任务计划触发单次运行，不要常驻轮询。"
 }

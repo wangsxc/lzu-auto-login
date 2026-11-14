@@ -79,6 +79,13 @@ def main():
         )
         print("     客户端:", out.replace("\n", " | ")[:160])
 
+        print("1b) 已认证时再跑一次 -> 应直接退出，不发起登录")
+        code, out = run_client()
+        st = http_json("/__state")
+        ok &= check("退出码 0（已在线属正常）", code == 0, f"code={code}")
+        ok &= check("未重复提交登录", st["login_count"] == 1, f"count={st['login_count']}")
+        ok &= check("输出提示已在线", "已在线" in out)
+
         print("2) 模拟路由器断电、验证态被抹除 -> 应能重新认证")
         control("offline")
         code, out = run_client()

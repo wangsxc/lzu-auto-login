@@ -4,10 +4,13 @@ LZU/iLZU 校园网自动登录脚本（深澜 srun V1.18 协议）
 自动检测网络并完成认证。
 
 用法:
-    python lzu_auto_login.py              一次检测并登录
-    python lzu_auto_login.py --watch      持续监控模式
-    python lzu_auto_login.py --test       仅检测网络状态
+    python lzu_auto_login.py              --once：单次检测，跑完即退（默认）
+    python lzu_auto_login.py --test       查看网络与认证状态
     python lzu_auto_login.py --logout     注销登录
+    python lzu_auto_login.py --watch      调试用低频循环（生产不用）
+
+设计：无常驻、无外网探测。开机由启动项 / 任务计划触发一次；
+      已认证时只查一次 rad_user_info 就退出，未认证才提交登录。
 """
 
 import base64
@@ -49,10 +52,12 @@ PASSWORD = os.environ.get("LZU_PASSWORD") or _CFG["password"]
 DOMAIN = _CFG.get("domain", "@study")        # @eLearning -> "@study"；@lzu.edu.cn -> ""
 PORTAL_HOST = _CFG.get("portal_host", "10.10.0.166")
 AC_ID = str(_CFG.get("ac_id", "2"))
-TARGET_SSIDS = _CFG.get("target_ssids", [])  # 空列表 = 不限制 SSID
-CHECK_INTERVAL = int(_CFG.get("check_interval", 60))
-LOGIN_COOLDOWN = int(_CFG.get("login_cooldown", 1800))
-ONLINE_PROBE = bool(_CFG.get("online_probe", True))  # False = 跳过外网探活（测试环境）
+CHECK_INTERVAL = int(_CFG.get("check_interval", 1800))  # 仅 --watch 调试用
+TARGET_SSIDS = _CFG.get("target_ssids", [])
+SSID_FILTER = bool(_CFG.get("ssid_filter", False))      # 默认不按 SSID 过滤
+RETRY_BACKOFF = _CFG.get("retry_backoff", [300, 900, 3600])  # 失败退避（秒）
+STATE_FILE = os.path.join(SCRIPT_DIR, _CFG.get("state_file", ".lzu_state.json"))
+LOCK_PORT = int(_CFG.get("lock_port", 47621))
 LOG_FILE = os.path.join(SCRIPT_DIR, _CFG.get("log_file", "lzu_auto_login.log"))
 
 # ============================================================
@@ -118,23 +123,8 @@ def can_reach(host, timeout=5):
         return False
 
 
-def is_online():
-    test_urls = [
-        "http://www.baidu.com/",
-        "http://captive.apple.com/hotspot-detect.html",
-    ]
-    for url in test_urls:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            resp = urllib.request.urlopen(req, timeout=5)
-            content = resp.read().decode(errors="replace")
-            if "captive.apple.com" in url and "Success" in content:
-                return True
-            if resp.getcode() == 200 and len(content) > 500:
-                return True
-        except Exception:
-            continue
-    return False
+# 外网探活（baidu / captive.apple.com）已移除：
+# 判活统一使用 Portal 自己的 /cgi-bin/rad_user_info，既准确又不访问外网。
 
 
 # ============================================================
@@ -426,81 +416,131 @@ def srun_logout():
 # ============================================================
 # 主逻辑
 # ============================================================
-def check_and_login():
-    """检测网络并在需要时自动登录。"""
-    if TARGET_SSIDS:
-        ssid = get_windows_ssid()
-        logger.info(f"当前 SSID: {ssid}")
-        if not ssid:
-            return False, "无法获取 SSID（未连接 WiFi？）"
-        if ssid not in TARGET_SSIDS:
-            return False, f"未连接目标网络（当前: {ssid}），跳过。"
-        logger.info(f"已连接目标网络: {ssid}")
-    else:
-        logger.info("未配置 SSID 白名单，跳过网络名检查")
+_LOCK_SOCKET = None
 
-    if ONLINE_PROBE and is_online():
-        logger.info("网络已通，无需登录。")
-        return False, "已在线"
+
+def acquire_lock():
+    """绑定本机端口做单实例锁：进程退出自动释放，不留残留锁文件。"""
+    global _LOCK_SOCKET
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", LOCK_PORT))
+        sock.listen(1)
+        _LOCK_SOCKET = sock
+        return True
+    except OSError:
+        sock.close()
+        return False
+
+
+def _read_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+def portal_status():
+    """向 Portal 查询权威认证态，返回 (True/False/None, 在线信息)。"""
+    url = f"http://{PORTAL_HOST}/cgi-bin/rad_user_info?callback=jsonp"
+    try:
+        data = _parse_jsonp(_http_get(url, timeout=5))
+    except Exception as e:
+        logger.debug(f"rad_user_info 查询失败: {e}")
+        return None, {}
+    online = data.get("error") == "ok" and bool(data.get("online_ip"))
+    return online, data
+
+
+def once():
+    """单次运行：已认证立即退出，未认证才登录。返回 (是否正常, 说明)。"""
+    if SSID_FILTER:
+        ssid = get_windows_ssid()
+        if ssid not in TARGET_SSIDS:
+            return True, f"非目标网络（{ssid}），跳过"
 
     if not can_reach(PORTAL_HOST):
-        return False, f"无法连接认证服务器 {PORTAL_HOST}"
+        return True, f"未接入校园网（{PORTAL_HOST} 不可达），跳过"
 
-    logger.info("检测到 captive portal，开始自动登录...")
+    online, info = portal_status()
+    if online is None:
+        return False, "认证状态查询失败"
+    if online:
+        logger.info(f"已认证 online_ip={info.get('online_ip')}，无需登录，退出。")
+        return True, "已在线"
 
+    state = _read_state()
+    fails = int(state.get("fail_count", 0))
+    if state.get("last_fail") and RETRY_BACKOFF:
+        wait = RETRY_BACKOFF[min(max(fails - 1, 0), len(RETRY_BACKOFF) - 1)]
+        if wait > 0 and time.time() - float(state["last_fail"]) < wait:
+            return True, f"上次失败未满 {wait}s 退避期，跳过"
+
+    logger.info("未认证，开始自动登录...")
     try:
         success, msg = srun_login()
-        return success, msg
     except Exception as e:
         logger.error(f"登录异常: {e}", exc_info=True)
-        return False, str(e)
+        success, msg = False, str(e)
+
+    if success:
+        _write_state({})
+    else:
+        _write_state({"fail_count": fails + 1, "last_fail": time.time()})
+    return success, msg
 
 
 def watch_loop():
-    """持续监控模式。"""
-    logger.info("启动监控模式（Ctrl+C 退出）...")
-    print(f"[提示] 正在监控网络，按 Ctrl+C 退出。日志: {LOG_FILE}")
-
-    last_login_time = 0
-
+    """调试用低频循环；生产请由启动项 / 任务计划触发 --once。"""
+    logger.info(f"调试监控模式，每 {CHECK_INTERVAL}s 一次（Ctrl+C 退出）")
     while True:
         try:
-            if time.time() - last_login_time < LOGIN_COOLDOWN:
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            success, msg = check_and_login()
-            if success:
-                last_login_time = time.time()
-                logger.info(f"冷却 {LOGIN_COOLDOWN}s 后恢复检测...")
+            once()
         except KeyboardInterrupt:
             logger.info("监控模式已退出。")
             break
         except Exception as e:
             logger.error(f"监控异常: {e}")
-
         time.sleep(CHECK_INTERVAL)
 
 
 def main():
     if "--test" in sys.argv:
+        reachable = can_reach(PORTAL_HOST)
+        online, info = portal_status() if reachable else (None, {})
+        label = "已认证" if online else "未认证" if online is False else "查询失败"
         print(f"SSID:            {get_windows_ssid()}")
         print(f"本机 IP:         {get_local_ip()}")
-        print(f"认证服务器可达:   {can_reach(PORTAL_HOST)}")
-        print(f"已在线:          {is_online()}")
+        print(f"Portal 可达:     {reachable}")
+        print(f"认证状态:        {label}")
+        print(f"在线 IP:         {info.get('online_ip', '-')}")
+        return
+
+    if "--logout" in sys.argv:
+        srun_logout()
         return
 
     if "--watch" in sys.argv:
         watch_loop()
-    elif "--logout" in sys.argv:
-        srun_logout()
-    else:
-        success, msg = check_and_login()
-        if success:
-            print(f"[OK] {msg}")
-        else:
-            print(f"[跳过] {msg}")
-            sys.exit(1)
+        return
+
+    if not acquire_lock():
+        logger.info("已有实例在运行，本次退出。")
+        return
+
+    ok, msg = once()
+    print(f"[{'OK' if ok else '失败'}] {msg}")
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
