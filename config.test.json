@@ -1,0 +1,13 @@
+{
+  "username": "testuser",
+  "password": "test_password_123",
+  "domain": "@study",
+  "portal_host": "127.0.0.1:8899",
+  "ac_id": "2",
+  "target_ssids": [],
+  "check_interval": 5,
+  "login_cooldown": 10,
+  "online_probe": false,
+  "log_file": "lzu_mock_test.log",
+  "_说明": "仅用于本地 mock 测试，账号密码都是假的，不含任何真实凭据。由 tests/run_mock_test.py 通过环境变量 LZU_CONFIG 自动加载。"
+}

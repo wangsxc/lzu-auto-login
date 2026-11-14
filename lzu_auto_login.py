@@ -29,8 +29,7 @@ import urllib.parse
 # 配置（凭据来自 config.json，该文件已被 .gitignore 排除）
 # ============================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
-LOG_FILE = os.path.join(SCRIPT_DIR, "lzu_auto_login.log")
+CONFIG_FILE = os.environ.get("LZU_CONFIG") or os.path.join(SCRIPT_DIR, "config.json")
 
 
 def _load_config():
@@ -50,9 +49,11 @@ PASSWORD = os.environ.get("LZU_PASSWORD") or _CFG["password"]
 DOMAIN = _CFG.get("domain", "@study")        # @eLearning -> "@study"；@lzu.edu.cn -> ""
 PORTAL_HOST = _CFG.get("portal_host", "10.10.0.166")
 AC_ID = str(_CFG.get("ac_id", "2"))
-TARGET_SSIDS = _CFG.get("target_ssids", [])
+TARGET_SSIDS = _CFG.get("target_ssids", [])  # 空列表 = 不限制 SSID
 CHECK_INTERVAL = int(_CFG.get("check_interval", 60))
 LOGIN_COOLDOWN = int(_CFG.get("login_cooldown", 1800))
+ONLINE_PROBE = bool(_CFG.get("online_probe", True))  # False = 跳过外网探活（测试环境）
+LOG_FILE = os.path.join(SCRIPT_DIR, _CFG.get("log_file", "lzu_auto_login.log"))
 
 # ============================================================
 # 日志（轮转 + 脱敏，避免明文凭据无限落盘）
@@ -98,7 +99,8 @@ def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(2)
-        s.connect((PORTAL_HOST, 80))
+        # PORTAL_HOST 可能带端口（测试环境 127.0.0.1:8899），UDP 探测只取主机部分
+        s.connect((PORTAL_HOST.split(":", 1)[0], 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
@@ -426,18 +428,18 @@ def srun_logout():
 # ============================================================
 def check_and_login():
     """检测网络并在需要时自动登录。"""
-    ssid = get_windows_ssid()
-    logger.info(f"当前 SSID: {ssid}")
+    if TARGET_SSIDS:
+        ssid = get_windows_ssid()
+        logger.info(f"当前 SSID: {ssid}")
+        if not ssid:
+            return False, "无法获取 SSID（未连接 WiFi？）"
+        if ssid not in TARGET_SSIDS:
+            return False, f"未连接目标网络（当前: {ssid}），跳过。"
+        logger.info(f"已连接目标网络: {ssid}")
+    else:
+        logger.info("未配置 SSID 白名单，跳过网络名检查")
 
-    if not ssid:
-        return False, "无法获取 SSID（未连接 WiFi？）"
-
-    if ssid not in TARGET_SSIDS:
-        return False, f"未连接目标网络（当前: {ssid}），跳过。"
-
-    logger.info(f"已连接目标网络: {ssid}")
-
-    if is_online():
+    if ONLINE_PROBE and is_online():
         logger.info("网络已通，无需登录。")
         return False, "已在线"
 

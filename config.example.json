@@ -7,5 +7,7 @@
   "target_ssids": ["LZU", "iLZU"],
   "check_interval": 60,
   "login_cooldown": 1800,
-  "_说明": "复制本文件为 config.json 后填写。config.json 已被 .gitignore 排除，也可用环境变量 LZU_USERNAME / LZU_PASSWORD 覆盖。domain 填 @study 对应 @eLearning（流量不限，断线后需重新认证）；填空字符串对应 @lzu.edu.cn（有记忆但流量有限）。"
+  "online_probe": true,
+  "log_file": "lzu_auto_login.log",
+  "_说明": "复制本文件为 config.json 后填写。config.json 已被 .gitignore 排除；可用环境变量 LZU_USERNAME / LZU_PASSWORD 覆盖账密，用 LZU_CONFIG 指定其他配置文件（测试环境由 tests/run_mock_test.py 自动设为 config.test.json）。domain 填 @study 对应 @eLearning（流量不限，断线或路由器重启后需重新认证）；填空字符串对应 @lzu.edu.cn（有记忆但流量有限）。target_ssids 留空数组表示不限制 SSID。online_probe 设为 false 时跳过外网探活，仅用于本地 mock 测试。"
 }
