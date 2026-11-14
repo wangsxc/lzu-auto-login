@@ -587,9 +587,12 @@ def _looks_occupied(msg):
     return any(hint in text for hint in _OCCUPY_HINTS)
 
 
-def once():
+def once(force=False):
     """单次流程：已认证则验联网；未认证先直接登录，失败且确认占用才解绑，
-    重新登录后必须验联网通过才算成功。"""
+    重新登录后必须验联网通过才算成功。
+
+    force=True（--boot 内每轮）时忽略失败退避，保证开机后的密集重试不被跳过。
+    """
     if SSID_FILTER:
         ssid = get_windows_ssid()
         if ssid not in TARGET_SSIDS:
@@ -610,7 +613,7 @@ def once():
 
     state = _read_state()
     fails = int(state.get("fail_count", 0))
-    if state.get("last_fail") and RETRY_BACKOFF:
+    if not force and state.get("last_fail") and RETRY_BACKOFF:
         wait = RETRY_BACKOFF[min(max(fails - 1, 0), len(RETRY_BACKOFF) - 1)]
         if wait > 0 and time.time() - float(state["last_fail"]) < wait:
             return True, f"上次失败未满 {wait}s 退避期，跳过"
@@ -666,7 +669,7 @@ def boot_loop():
             time.sleep(delay)
         logger.info(f"--- 开机守护 第 {i}/{len(delays)} 次 ---")
         try:
-            ok, msg = once()
+            ok, msg = once(force=True)
             logger.info(f"第 {i} 次结果: {msg}")
         except Exception as e:
             logger.error(f"第 {i} 次异常: {e}")

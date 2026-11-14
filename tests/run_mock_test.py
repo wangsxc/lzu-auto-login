@@ -151,6 +151,15 @@ def main():
         ok &= check("提示联网验证失败", "联网验证失败" in out)
         control("online", internet="auto")
 
+        print("8) --boot 期间前一轮失败，后续轮次仍要执行（不被退避跳过）")
+        control("sign_error", internet="auto")
+        code, out = run_client("--boot")
+        st = http_json("/__state")
+        logins = [h for h in st["history"] if h["event"] == "login"]
+        ok &= check("3 轮都尝试了登录", len(logins) >= 3,
+                    f"login events={len(logins)}")
+        control("online", internet="auto")
+
         print("\n结果:", "全部通过" if ok else "存在失败项")
         return 0 if ok else 1
     finally:
