@@ -10,8 +10,10 @@
   "retry_backoff": [0, 0, 0],
   "boot_schedule": [0, 0, 0],
   "auto_release": true,
+  "release_cooldown": 0,
+  "internet_probe_urls": ["http://127.0.0.1:8899/__internet"],
   "state_file": ".lzu_state.test.json",
   "lock_port": 47629,
   "log_file": "lzu_mock_test.log",
-  "_说明": "仅用于本地 mock 测试，账号密码都是假的，不含任何真实凭据。由 tests/run_mock_test.py 通过环境变量 LZU_CONFIG 自动加载。retry_backoff 全 0 表示不启用退避，boot_schedule 三个 0 表示 --boot 连跑三次且不等待，lock_port 与生产分开避免冲突。"
+  "_说明": "仅用于本地 mock 测试，账号密码都是假的，不含任何真实凭据。由 tests/run_mock_test.py 通过环境变量 LZU_CONFIG 自动加载。retry_backoff 全 0 表示不启用退避，release_cooldown=0 表示不启用解绑冷却，boot_schedule 三个 0 表示 --boot 连跑三次且不等待；internet_probe_urls 指向 mock 的 /__internet，使联网验证完全离线自洽；lock_port 与生产分开避免冲突。"
 }

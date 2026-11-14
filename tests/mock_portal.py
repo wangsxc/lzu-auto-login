@@ -45,6 +45,8 @@ class PortalState:
         self.challenge_time = 0.0
         self.username = ""
         self.login_count = 0
+        self.dm_count = 0
+        self.internet_override = None
         self.history = []
 
     def new_challenge(self):
@@ -99,19 +101,38 @@ class Handler(BaseHTTPRequestHandler):
                 "state": STATE.state,
                 "authenticated": STATE.state == "online",
                 "login_count": STATE.login_count,
+                "dm_count": STATE.dm_count,
+                "internet_override": STATE.internet_override,
                 "username": STATE.username,
-                "history": STATE.history[-10:],
+                "history": STATE.history[-12:],
             }, ensure_ascii=False, indent=2))
 
         if path == "/__control":
             new = _first(q, "state", "offline")
-            if new not in ("offline", "online", "occupied", "sign_error"):
+            if new not in ("offline", "online", "occupied", "sign_error", "self_occupied"):
                 return self._send(json.dumps({"error": "unknown state"}), code=400)
+            internet = _first(q, "internet", "")
+            if internet in ("0", "1"):
+                STATE.internet_override = internet == "1"
+            elif internet == "auto":
+                STATE.internet_override = None
             STATE.state = new
             if new == "offline":
                 STATE.challenge = ""
-            STATE.record(f"control -> {new}")
-            return self._send(json.dumps({"state": new}))
+            STATE.record(f"control -> {new}" + (f" internet={internet}" if internet else ""))
+            return self._send(json.dumps({
+                "state": new, "internet_override": STATE.internet_override,
+            }))
+
+        if path == "/__internet":
+            # 模拟联网探测：override 优先，否则按是否已认证决定
+            ok = STATE.internet_override
+            if ok is None:
+                ok = STATE.state in ("online", "self_occupied")
+            return self._send(
+                "Success" if ok else "<html>portal hijack</html>",
+                "text/html; charset=utf-8",
+            )
 
         if path == "/cgi-bin/get_challenge":
             token = STATE.new_challenge()
@@ -130,6 +151,21 @@ class Handler(BaseHTTPRequestHandler):
             online = STATE.state == "online"
             occupied = STATE.state == "occupied"
             STATE.record("rad_user_info")
+            if STATE.state == "self_occupied":
+                # 占用设备其实就是本机自己，但本机其实能联网
+                return self._send(_jsonp(_first(q, "callback", "jsonp"), {
+                    "error": "not_online",
+                    "online_ip": CLIENT_IP,
+                    "user_name": STATE.username or "testuser",
+                    "domain": "study",
+                    "products_name": "学生办公",
+                    "online_device_total": "1",
+                    "online_device_detail": json.dumps({
+                        "9002": {"ip": CLIENT_IP, "os_name": "Windows 10", "class_name": "Windows"}
+                    }),
+                    "add_time": int(time.time()),
+                    "ServerFlag": 4294967040,
+                }))
             if occupied:
                 # 模拟手机占用：本机未认证，但账号下已有别的设备在线
                 other_ip = "10.99.0.88"
@@ -167,6 +203,7 @@ class Handler(BaseHTTPRequestHandler):
             sign = _first(q, "sign")
             expect = hashlib.sha1(f"{t}{u}{ip}{unb}{t}".encode()).hexdigest()
             ok = sign == expect and unb == "1"
+            STATE.dm_count += 1
             STATE.record("rad_user_dm", sign_ok=ok, ip=ip)
             if ok and STATE.state == "occupied":
                 STATE.state = "offline"
@@ -226,6 +263,8 @@ class Handler(BaseHTTPRequestHandler):
             result = "sign_error"
         elif STATE.state == "occupied":
             result = "occupied -> login_error"
+        elif STATE.state == "self_occupied":
+            result = "self_occupied -> login_error"
         elif STATE.state == "sign_error":
             result = "forced sign_error"
 
@@ -233,7 +272,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if result in ("sign_error", "forced sign_error"):
             return self._send("sign_error")
-        if result.startswith("occupied"):
+        if result.startswith(("occupied", "self_occupied")):
             return self._send("login_error#Authentication success,Welcome!")
 
         STATE.state = "online"

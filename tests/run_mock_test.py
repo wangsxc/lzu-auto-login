@@ -29,8 +29,11 @@ def http_json(path):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def control(state):
-    return http_json("/__control?state=" + state)
+def control(state, **extra):
+    query = "state=" + state
+    for key, value in extra.items():
+        query += f"&{key}={value}"
+    return http_json("/__control?" + query)
 
 
 def run_client(*args):
@@ -93,16 +96,26 @@ def main():
         ok &= check("掉线后重新登录成功", code == 0 and st["authenticated"] is True)
         ok &= check("累计登录 2 次", st["login_count"] == 2, f"count={st['login_count']}")
 
-        print("3) 模拟账号被手机占用 -> 应自动解绑并登录成功")
+        print("3) 模拟账号被手机占用 -> 先直接登录失败，再解绑重试并验联网")
         control("occupied")
         code, out = run_client()
         st = http_json("/__state")
         dm = [h for h in st["history"] if h["event"] == "rad_user_dm"]
+        logins = [h for h in st["history"] if h["event"] == "login"]
         ok &= check("退出码 0", code == 0, f"code={code}")
-        ok &= check("调用了 rad_user_dm 解绑", bool(dm))
+        ok &= check("先尝试直接登录且失败", bool(logins) and any(
+            h["result"].startswith("occupied") for h in logins
+        ))
+        seq = [h["event"] for h in st["history"]]
+        first_login = next((i for i, e in enumerate(seq) if e == "login"), -1)
+        first_dm = next((i for i, e in enumerate(seq) if e == "rad_user_dm"), -1)
+        ok &= check("登录失败后才调用解绑", 0 <= first_login < first_dm,
+                    f"login@{first_login} dm@{first_dm}")
         ok &= check("解绑 sign 校验通过", bool(dm) and all(h.get("sign_ok") for h in dm))
         ok &= check("解绑的是占用设备 IP", any(h.get("ip") == "10.99.0.88" for h in dm))
-        ok &= check("最终登录成功", st["authenticated"] is True)
+        ok &= check("解绑后重新登录成功", any(h["result"] == "login_ok" for h in logins))
+        ok &= check("登录成功后联网验证通过", "联网验证通过" in out)
+        ok &= check("最终已认证", st["authenticated"] is True)
         ok &= check("累计登录 3 次", st["login_count"] == 3, f"count={st['login_count']}")
 
         print("4) rad_user_info 状态查询")
@@ -121,6 +134,22 @@ def main():
         ok &= check("退出码 0", code == 0, f"code={code}")
         ok &= check("跑完 3 次后自动退出", "开机守护完成" in out)
         ok &= check("最终已认证", st["authenticated"] is True)
+
+        print("6) 占用设备其实是本机自己 -> 必须拒绝自我解绑")
+        control("self_occupied", internet=1)
+        before = http_json("/__state")["dm_count"]
+        code, out = run_client()
+        after = http_json("/__state")["dm_count"]
+        ok &= check("没有调用 rad_user_dm", after == before, f"dm {before}->{after}")
+        ok &= check("明确判定为拒绝解绑", "拒绝" in out)
+        ok &= check("不误报登录成功", code != 0, f"code={code}")
+
+        print("7) 服务端返回登录成功但本机联网不通 -> 必须判为失败")
+        control("offline", internet=0)
+        code, out = run_client()
+        ok &= check("退出码非 0", code != 0, f"code={code}")
+        ok &= check("提示联网验证失败", "联网验证失败" in out)
+        control("online", internet="auto")
 
         print("\n结果:", "全部通过" if ok else "存在失败项")
         return 0 if ok else 1

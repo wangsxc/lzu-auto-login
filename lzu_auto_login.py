@@ -10,11 +10,14 @@ LZU/iLZU 校园网自动登录脚本（深澜 srun V1.18 协议）
     python lzu_auto_login.py --logout     注销登录
     python lzu_auto_login.py --watch      调试用低频循环（生产不用）
 
-设计：不常驻、无外网探测。开机由启动项触发 --boot：
+设计：不常驻、不做轮询式外网探测。开机由启动项触发 --boot：
       先判断是否在目标网络，立即跑一次；随后 5 分钟每分钟一次，
       再后 30 分钟每 10 分钟一次，共 9 次后进程退出。
-      已认证时只查一次 rad_user_info 就结束本轮；未认证才登录；
-      账号被其他设备占用时先调 /cgi-bin/rad_user_dm 解绑再登录。
+      每轮流程：已认证 -> 验联网；未认证 -> 先直接登录；
+      仅当登录失败且确认是占用，才调 /cgi-bin/rad_user_dm 解绑并重试；
+      服务端返回登录成功不算数，必须本机联网验证通过才算成功。
+      解绑前若本机已能联网、冷却未过、或在线设备就是本机，一律拒绝，
+      避免"自己把自己占用了又自己解除"的循环。
 """
 
 import base64
@@ -63,6 +66,12 @@ RETRY_BACKOFF = _CFG.get("retry_backoff", [300, 900, 3600])  # 失败退避（�
 # 开机后的有界短时守护：0 立即，随后 5 次 ×60s，再 3 次 ×600s，跑完即退出
 BOOT_SCHEDULE = _CFG.get("boot_schedule", [0, 60, 60, 60, 60, 60, 600, 600, 600])
 AUTO_RELEASE = bool(_CFG.get("auto_release", True))  # 账号被占用时自动解绑
+RELEASE_COOLDOWN = int(_CFG.get("release_cooldown", 600))  # 两次解绑最小间隔
+INTERNET_PROBE_URLS = _CFG.get("internet_probe_urls", [
+    "http://www.baidu.com/",
+    "http://captive.apple.com/hotspot-detect.html",
+])
+LAST_CLIENT_IP = ""  # Portal 侧看到的本机 IP，由 _get_challenge 写入
 STATE_FILE = os.path.join(SCRIPT_DIR, _CFG.get("state_file", ".lzu_state.json"))
 LOCK_PORT = int(_CFG.get("lock_port", 47621))
 LOG_FILE = os.path.join(SCRIPT_DIR, _CFG.get("log_file", "lzu_auto_login.log"))
@@ -294,6 +303,8 @@ def _get_challenge():
 
     challenge = data["challenge"]
     client_ip = data.get("client_ip", ip)
+    global LAST_CLIENT_IP
+    LAST_CLIENT_IP = client_ip
     logger.info(f"challenge={challenge[:20]}..., client_ip={client_ip}")
     return challenge, client_ip
 
@@ -502,34 +513,73 @@ def release_device(ip=""):
     return resp
 
 
-def _release_if_occupied(info):
-    """rad_user_info 显示账号下已有别的设备在线时，先解绑。返回是否执行过。"""
-    if not AUTO_RELEASE:
-        return False
-    try:
-        total = int(info.get("online_device_total") or 0)
-    except (TypeError, ValueError):
-        total = 0
-    if total <= 0:
-        return False
+def verify_internet():
+    """单次验证本机是否真的能上网（不是轮询）。
 
-    ip = info.get("online_ip") or ""
+    被 Portal 劫持时明文 HTTP 会 302 到认证主机，据此判定为"未通"。
+    只在登录成功后、以及准备解绑前各调用一次。
+    """
+    portal_ip = PORTAL_HOST.split(":", 1)[0]
+    for url in INTERNET_PROBE_URLS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                final = resp.geturl()
+                body = resp.read(4096).decode("utf-8", errors="replace")
+            # 只有"跳到另一个主机上的 Portal"才算被劫持；
+            # 测试环境探测地址本就与 mock Portal 同机，不能误判
+            if (portal_ip
+                    and urllib.parse.urlparse(final).hostname == portal_ip
+                    and urllib.parse.urlparse(url).hostname != portal_ip):
+                logger.debug(f"联网探测被劫持到 Portal: {final}")
+                continue
+            if "hotspot" in url or "__internet" in url:
+                if "Success" in body:
+                    return True
+            elif len(body) > 200:
+                return True
+        except Exception as e:
+            logger.debug(f"联网探测失败 {url}: {e}")
+    return False
+
+
+def _try_release(info, state):
+    """仅在登录失败且疑似占用时调用；返回 (是否解绑, 说明)。
+
+    三道保险，防止"自己把自己踢下线"再自己解一遍：
+      1. 本机当前能联网        -> 绝不解除
+      2. 距上次解绑太近        -> 不重复解除
+      3. 在线设备只有本机 IP   -> 绝不解除
+    """
+    if not AUTO_RELEASE:
+        return False, "自动解绑已关闭"
+    if verify_internet():
+        return False, "本机当前可联网，判定为未占用，拒绝解绑"
+
+    last = float(state.get("last_release") or 0)
+    if RELEASE_COOLDOWN > 0 and time.time() - last < RELEASE_COOLDOWN:
+        return False, f"距上次解绑不足 {RELEASE_COOLDOWN}s，跳过"
+
+    own = LAST_CLIENT_IP or ""
+    candidates = []
     try:
         detail = json.loads(info.get("online_device_detail") or "{}")
         for dev in detail.values():
-            if isinstance(dev, dict) and dev.get("ip"):
-                ip = dev["ip"]
-                break
+            ip = dev.get("ip") if isinstance(dev, dict) else ""
+            if ip and ip != own:
+                candidates.append(ip)
     except Exception:
         pass
+    if not candidates:
+        ip = info.get("online_ip") or ""
+        if not ip or ip == own:
+            return False, "在线设备就是本机，拒绝自我解绑"
+        candidates = [ip]
 
-    logger.warning(f"账号下已有 {total} 台设备在线（疑似占用），尝试解绑 ip={ip or '<空>'}")
-    try:
-        release_device(ip)
-        return True
-    except Exception as e:
-        logger.error(f"DM 解绑失败: {e}")
-        return False
+    target = candidates[0]
+    release_device(target)
+    state["last_release"] = time.time()
+    return True, f"已解绑占用设备 {target}"
 
 
 def _looks_occupied(msg):
@@ -538,7 +588,8 @@ def _looks_occupied(msg):
 
 
 def once():
-    """单次运行：已认证立即退出；未认证时先处理占用再登录。"""
+    """单次流程：已认证则验联网；未认证先直接登录，失败且确认占用才解绑，
+    重新登录后必须验联网通过才算成功。"""
     if SSID_FILTER:
         ssid = get_windows_ssid()
         if ssid not in TARGET_SSIDS:
@@ -551,8 +602,11 @@ def once():
     if online is None:
         return False, "认证状态查询失败"
     if online:
-        logger.info(f"已认证 online_ip={info.get('online_ip')}，无需登录，退出。")
-        return True, "已在线"
+        if verify_internet():
+            logger.info(f"已认证 online_ip={info.get('online_ip')}，本机联网正常，退出。")
+            return True, "已在线（联网正常）"
+        logger.warning("已认证但本机联网验证失败；不做任何解绑，等下轮重试")
+        return False, "已认证但联网异常"
 
     state = _read_state()
     fails = int(state.get("fail_count", 0))
@@ -561,31 +615,44 @@ def once():
         if wait > 0 and time.time() - float(state["last_fail"]) < wait:
             return True, f"上次失败未满 {wait}s 退避期，跳过"
 
-    released = _release_if_occupied(info)
-
-    logger.info("未认证，开始自动登录...")
+    # 先直接登录，绝不预先解绑
+    logger.info("未认证，先尝试直接登录...")
     try:
         success, msg = srun_login()
     except Exception as e:
         logger.error(f"登录异常: {e}", exc_info=True)
         success, msg = False, str(e)
 
-    # 登录响应本身提示占用：再解绑一次并重试登录
-    if not success and not released and _looks_occupied(msg) and AUTO_RELEASE:
-        logger.warning(f"登录响应疑似账号被占用: {msg}")
-        try:
-            release_device(info.get("online_ip") or "")
-            released = True
-            success, msg = srun_login()
-        except Exception as e:
-            logger.error(f"解绑后重试登录失败: {e}")
-            success, msg = False, str(e)
+    # 只有登录失败且响应疑似占用，才尝试解绑并重试一次
+    if not success and _looks_occupied(msg) and AUTO_RELEASE:
+        logger.warning(f"登录失败且疑似账号被占用: {msg}")
+        released, why = _try_release(info, state)
+        logger.info(f"占用处理: {why}")
+        if released:
+            try:
+                success, msg = srun_login()
+            except Exception as e:
+                logger.error(f"解绑后重试登录失败: {e}")
+                success, msg = False, str(e)
 
+    # 服务端说成功不算数，必须确认本机真的能联网
     if success:
-        _write_state({})
-    else:
-        _write_state({"fail_count": fails + 1, "last_fail": time.time()})
-    return success, msg
+        if verify_internet():
+            logger.info("登录成功且本机联网验证通过")
+            # 保留 last_release，避免刚解绑成功又立刻触发下一次解绑
+            keep = {}
+            if state.get("last_release"):
+                keep["last_release"] = state["last_release"]
+            _write_state(keep)
+            return True, "登录成功（联网验证通过）"
+        logger.error("服务端返回登录成功，但本机联网验证失败")
+        state.update({"fail_count": fails + 1, "last_fail": time.time()})
+        _write_state(state)
+        return False, "登录返回成功但本机联网验证失败"
+
+    state.update({"fail_count": fails + 1, "last_fail": time.time()})
+    _write_state(state)
+    return False, msg
 
 
 def boot_loop():
