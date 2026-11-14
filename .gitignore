@@ -1,0 +1,24 @@
+# 凭据：含明文账号密码，严禁入库
+config.json
+config.toml
+.env
+*.secret
+*.key
+
+# 日志：可能含 token 与调试信息，严禁入库
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地工作区数据
+.workbuddy/
