@@ -128,7 +128,24 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/cgi-bin/rad_user_info":
             online = STATE.state == "online"
+            occupied = STATE.state == "occupied"
             STATE.record("rad_user_info")
+            if occupied:
+                # 模拟手机占用：本机未认证，但账号下已有别的设备在线
+                other_ip = "10.99.0.88"
+                return self._send(_jsonp(_first(q, "callback", "jsonp"), {
+                    "error": "not_online",
+                    "online_ip": other_ip,
+                    "user_name": STATE.username or "testuser",
+                    "domain": "study",
+                    "products_name": "学生办公",
+                    "online_device_total": "2",
+                    "online_device_detail": json.dumps({
+                        "9001": {"ip": other_ip, "os_name": "Android", "class_name": "Phone"}
+                    }),
+                    "add_time": int(time.time()),
+                    "ServerFlag": 4294967040,
+                }))
             return self._send(_jsonp(_first(q, "callback", "jsonp"), {
                 "error": "ok" if online else "not_online",
                 "online_ip": CLIENT_IP if online else "",
@@ -139,6 +156,26 @@ class Handler(BaseHTTPRequestHandler):
                 "online_device_detail": "{}",
                 "add_time": int(time.time()),
                 "ServerFlag": 4294967040,
+            }))
+
+        if path == "/cgi-bin/rad_user_dm":
+            # 复刻 Portal.js: sign = sha1(time + username + ip + unbind + time)
+            t = _first(q, "time")
+            u = _first(q, "username")
+            ip = _first(q, "ip")
+            unb = _first(q, "unbind")
+            sign = _first(q, "sign")
+            expect = hashlib.sha1(f"{t}{u}{ip}{unb}{t}".encode()).hexdigest()
+            ok = sign == expect and unb == "1"
+            STATE.record("rad_user_dm", sign_ok=ok, ip=ip)
+            if ok and STATE.state == "occupied":
+                STATE.state = "offline"
+                STATE.challenge = ""
+                return self._send(_jsonp(_first(q, "callback", "jQuery"), {
+                    "ecode": 0, "res": "ok", "error": "ok",
+                }))
+            return self._send(_jsonp(_first(q, "callback", "jQuery"), {
+                "ecode": 1, "res": "error", "error": "unbind_failed",
             }))
 
         return self._send("not found", "text/plain", 404)

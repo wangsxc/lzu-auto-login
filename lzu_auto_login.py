@@ -5,12 +5,16 @@ LZU/iLZU 校园网自动登录脚本（深澜 srun V1.18 协议）
 
 用法:
     python lzu_auto_login.py              --once：单次检测，跑完即退（默认）
+    python lzu_auto_login.py --boot       开机守护：有界短时重试，跑完即退
     python lzu_auto_login.py --test       查看网络与认证状态
     python lzu_auto_login.py --logout     注销登录
     python lzu_auto_login.py --watch      调试用低频循环（生产不用）
 
-设计：无常驻、无外网探测。开机由启动项 / 任务计划触发一次；
-      已认证时只查一次 rad_user_info 就退出，未认证才提交登录。
+设计：不常驻、无外网探测。开机由启动项触发 --boot：
+      先判断是否在目标网络，立即跑一次；随后 5 分钟每分钟一次，
+      再后 30 分钟每 10 分钟一次，共 9 次后进程退出。
+      已认证时只查一次 rad_user_info 就结束本轮；未认证才登录；
+      账号被其他设备占用时先调 /cgi-bin/rad_user_dm 解绑再登录。
 """
 
 import base64
@@ -56,6 +60,9 @@ CHECK_INTERVAL = int(_CFG.get("check_interval", 1800))  # 仅 --watch 调试用
 TARGET_SSIDS = _CFG.get("target_ssids", [])
 SSID_FILTER = bool(_CFG.get("ssid_filter", False))      # 默认不按 SSID 过滤
 RETRY_BACKOFF = _CFG.get("retry_backoff", [300, 900, 3600])  # 失败退避（秒）
+# 开机后的有界短时守护：0 立即，随后 5 次 ×60s，再 3 次 ×600s，跑完即退出
+BOOT_SCHEDULE = _CFG.get("boot_schedule", [0, 60, 60, 60, 60, 60, 600, 600, 600])
+AUTO_RELEASE = bool(_CFG.get("auto_release", True))  # 账号被占用时自动解绑
 STATE_FILE = os.path.join(SCRIPT_DIR, _CFG.get("state_file", ".lzu_state.json"))
 LOCK_PORT = int(_CFG.get("lock_port", 47621))
 LOG_FILE = os.path.join(SCRIPT_DIR, _CFG.get("log_file", "lzu_auto_login.log"))
@@ -461,8 +468,77 @@ def portal_status():
     return online, data
 
 
+# 账号被别的设备占用时，服务端常见的错误特征
+_OCCUPY_HINTS = (
+    "authentication success", "auth_info_error", "occupied",
+    "already online", "max", "limit", "并发", "设备数",
+)
+
+
+def release_device(ip=""):
+    """调用 /cgi-bin/rad_user_dm 解绑（踢下线）指定 IP 的在线设备。
+
+    参数与 Portal.js 的 _logoutDm 一致：
+        sign = sha1(time + username + ip + unbind + time), unbind = 1
+    """
+    username = f"{USERNAME}{DOMAIN}"
+    ts = int(time.time())
+    unbind = 1
+    sign = hashlib.sha1(
+        f"{ts}{username}{ip}{unbind}{ts}".encode()
+    ).hexdigest()
+    params = {
+        "callback": "jQuery",
+        "ip": ip,
+        "username": username,
+        "time": str(ts),
+        "unbind": str(unbind),
+        "sign": sign,
+    }
+    url = f"http://{PORTAL_HOST}/cgi-bin/rad_user_dm?" + urllib.parse.urlencode(params)
+    logger.info(f"请求 DM 解绑下线: ip={ip or '<空>'}")
+    resp = _http_get(url, timeout=8)
+    logger.debug(f"DM 解绑响应: {resp[:200]}")
+    return resp
+
+
+def _release_if_occupied(info):
+    """rad_user_info 显示账号下已有别的设备在线时，先解绑。返回是否执行过。"""
+    if not AUTO_RELEASE:
+        return False
+    try:
+        total = int(info.get("online_device_total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0:
+        return False
+
+    ip = info.get("online_ip") or ""
+    try:
+        detail = json.loads(info.get("online_device_detail") or "{}")
+        for dev in detail.values():
+            if isinstance(dev, dict) and dev.get("ip"):
+                ip = dev["ip"]
+                break
+    except Exception:
+        pass
+
+    logger.warning(f"账号下已有 {total} 台设备在线（疑似占用），尝试解绑 ip={ip or '<空>'}")
+    try:
+        release_device(ip)
+        return True
+    except Exception as e:
+        logger.error(f"DM 解绑失败: {e}")
+        return False
+
+
+def _looks_occupied(msg):
+    text = (msg or "").lower()
+    return any(hint in text for hint in _OCCUPY_HINTS)
+
+
 def once():
-    """单次运行：已认证立即退出，未认证才登录。返回 (是否正常, 说明)。"""
+    """单次运行：已认证立即退出；未认证时先处理占用再登录。"""
     if SSID_FILTER:
         ssid = get_windows_ssid()
         if ssid not in TARGET_SSIDS:
@@ -485,6 +561,8 @@ def once():
         if wait > 0 and time.time() - float(state["last_fail"]) < wait:
             return True, f"上次失败未满 {wait}s 退避期，跳过"
 
+    released = _release_if_occupied(info)
+
     logger.info("未认证，开始自动登录...")
     try:
         success, msg = srun_login()
@@ -492,11 +570,40 @@ def once():
         logger.error(f"登录异常: {e}", exc_info=True)
         success, msg = False, str(e)
 
+    # 登录响应本身提示占用：再解绑一次并重试登录
+    if not success and not released and _looks_occupied(msg) and AUTO_RELEASE:
+        logger.warning(f"登录响应疑似账号被占用: {msg}")
+        try:
+            release_device(info.get("online_ip") or "")
+            released = True
+            success, msg = srun_login()
+        except Exception as e:
+            logger.error(f"解绑后重试登录失败: {e}")
+            success, msg = False, str(e)
+
     if success:
         _write_state({})
     else:
         _write_state({"fail_count": fails + 1, "last_fail": time.time()})
     return success, msg
+
+
+def boot_loop():
+    """开机后有界短时守护：按 BOOT_SCHEDULE 跑完即退出，绝不常驻。"""
+    delays = list(BOOT_SCHEDULE)
+    logger.info(
+        f"开机守护启动：共 {len(delays)} 次，约 {sum(delays) / 60:.0f} 分钟后自动退出"
+    )
+    for i, delay in enumerate(delays, 1):
+        if delay > 0:
+            time.sleep(delay)
+        logger.info(f"--- 开机守护 第 {i}/{len(delays)} 次 ---")
+        try:
+            ok, msg = once()
+            logger.info(f"第 {i} 次结果: {msg}")
+        except Exception as e:
+            logger.error(f"第 {i} 次异常: {e}")
+    logger.info("开机守护完成，进程退出（不常驻）。")
 
 
 def watch_loop():
@@ -535,6 +642,10 @@ def main():
 
     if not acquire_lock():
         logger.info("已有实例在运行，本次退出。")
+        return
+
+    if "--boot" in sys.argv:
+        boot_loop()
         return
 
     ok, msg = once()

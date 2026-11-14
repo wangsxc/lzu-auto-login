@@ -33,11 +33,11 @@ def control(state):
     return http_json("/__control?state=" + state)
 
 
-def run_client():
+def run_client(*args):
     env = dict(os.environ, LZU_CONFIG=str(CONFIG))
     proc = subprocess.run(
-        [PY, str(ROOT / "lzu_auto_login.py")],
-        env=env, capture_output=True, text=True, timeout=30,
+        [PY, str(ROOT / "lzu_auto_login.py"), *args],
+        env=env, capture_output=True, text=True, timeout=60,
     )
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
@@ -93,15 +93,17 @@ def main():
         ok &= check("掉线后重新登录成功", code == 0 and st["authenticated"] is True)
         ok &= check("累计登录 2 次", st["login_count"] == 2, f"count={st['login_count']}")
 
-        print("3) 模拟账号被手机占用 -> 应失败且不误报成功")
+        print("3) 模拟账号被手机占用 -> 应自动解绑并登录成功")
         control("occupied")
         code, out = run_client()
         st = http_json("/__state")
-        ok &= check("返回非零退出码", code != 0, f"code={code}")
-        ok &= check("服务端识别为占用场景", any(
-            h.get("result", "").startswith("occupied") for h in st["history"]
-        ))
-        ok &= check("登录次数未增加", st["login_count"] == 2, f"count={st['login_count']}")
+        dm = [h for h in st["history"] if h["event"] == "rad_user_dm"]
+        ok &= check("退出码 0", code == 0, f"code={code}")
+        ok &= check("调用了 rad_user_dm 解绑", bool(dm))
+        ok &= check("解绑 sign 校验通过", bool(dm) and all(h.get("sign_ok") for h in dm))
+        ok &= check("解绑的是占用设备 IP", any(h.get("ip") == "10.99.0.88" for h in dm))
+        ok &= check("最终登录成功", st["authenticated"] is True)
+        ok &= check("累计登录 3 次", st["login_count"] == 3, f"count={st['login_count']}")
 
         print("4) rad_user_info 状态查询")
         control("online")
@@ -111,6 +113,14 @@ def main():
             text = resp.read().decode("utf-8")
         data = json.loads(text[text.index("(") + 1: text.rindex(")")])
         ok &= check("在线态返回 online_ip", bool(data["online_ip"]), data["online_ip"])
+
+        print("5) --boot 有界调度（测试配置 3 次，间隔 0）")
+        control("offline")
+        code, out = run_client("--boot")
+        st = http_json("/__state")
+        ok &= check("退出码 0", code == 0, f"code={code}")
+        ok &= check("跑完 3 次后自动退出", "开机守护完成" in out)
+        ok &= check("最终已认证", st["authenticated"] is True)
 
         print("\n结果:", "全部通过" if ok else "存在失败项")
         return 0 if ok else 1

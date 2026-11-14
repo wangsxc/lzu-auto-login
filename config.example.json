@@ -4,12 +4,14 @@
   "domain": "@study",
   "portal_host": "10.10.0.166",
   "ac_id": "2",
-  "target_ssids": [],
-  "ssid_filter": false,
+  "target_ssids": ["LZU", "iLZU", "你的WiFi名"],
+  "ssid_filter": true,
   "check_interval": 1800,
   "retry_backoff": [300, 900, 3600],
+  "boot_schedule": [0, 60, 60, 60, 60, 60, 600, 600, 600],
+  "auto_release": true,
   "state_file": ".lzu_state.json",
   "lock_port": 47621,
   "log_file": "lzu_auto_login.log",
-  "_说明": "复制本文件为 config.json 后填写。config.json 已被 .gitignore 排除；可用环境变量 LZU_USERNAME / LZU_PASSWORD 覆盖账密，用 LZU_CONFIG 指定其他配置文件（测试由 tests/run_mock_test.py 自动设为 config.test.json）。domain 填 @study 对应 @eLearning（流量不限，断电或长时间离线后需重新认证）；填空字符串对应 @lzu.edu.cn（有记忆但流量有限）。脚本默认单次运行（--once）：已认证只查一次 rad_user_info 就退出，未认证才登录。ssid_filter 默认 false，不按 WiFi 名过滤；check_interval 仅用于 --watch 调试；retry_backoff 是连续失败后的退避秒数。生产请用启动项 / 任务计划触发单次运行，不要常驻轮询。"
+  "_说明": "复制本文件为 config.json 后填写。config.json 已被 .gitignore 排除；可用环境变量 LZU_USERNAME / LZU_PASSWORD 覆盖账密，用 LZU_CONFIG 指定其他配置文件。domain 填 @study 对应 @eLearning（流量不限，断电或长时间离线后需重新认证）；填空字符串对应 @lzu.edu.cn（有记忆但流量有限）。target_ssids 是开机时判断的目标网络，ssid_filter=true 时不在列表内直接跳过。boot_schedule 是开机守护的间隔序列（秒）：0 立即执行一次，随后 5 次各 60 秒（前 5 分钟每分钟一次），再 3 次各 600 秒（后 30 分钟每 10 分钟一次），共 9 次约 35 分钟后进程退出，不常驻。auto_release=true 时，若 rad_user_info 显示账号被其他设备占用或登录报占用类错误，先调 /cgi-bin/rad_user_dm 解绑再登录（会踢掉其他设备）。retry_backoff 是连续失败后的退避秒数；check_interval 仅用于 --watch 调试。"
 }
