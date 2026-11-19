@@ -1,0 +1,22 @@
+{
+  "_note": "复制为 config.json 放到 /overlay/lzu/，填入真实账密。账密绝不入库（.gitignore 已排除 config.json）。",
+  "username": "your_account",
+  "password": "your_password",
+  "domain": "@study",
+  "ac_id": "2",
+  "portal_host": "10.10.0.166",
+  "probe_urls": [
+    "http://captive.apple.com/hotspot-detect.html",
+    "http://www.msftconnecttest.com/connecttest.txt",
+    "http://cp.cloudflare.com/generate_204"
+  ],
+  "probe_expect": ["Success", "Microsoft Connect Test", null],
+  "miss_threshold": 2,
+  "verify_attempts": 6,
+  "verify_interval": 2.5,
+  "auto_release": true,
+  "release_cooldown": 600,
+  "poll_intervals": [60, 120, 300, 600, 900],
+  "backoff": [60, 120, 240, 480, 900],
+  "http_timeout": 6
+}
