@@ -32,4 +32,5 @@ _backup_before_cleanup/
 # 路由器调试辅助（临时文件，不属于部署内容）
 router/_telnet_run.py
 router/_test_vector.lua
+router/_test_selfsvc.lua
 router/state.json
