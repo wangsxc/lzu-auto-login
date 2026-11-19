@@ -492,7 +492,10 @@ def release_device(ip=""):
     参数与 Portal.js 的 _logoutDm 一致：
         sign = sha1(time + username + ip + unbind + time), unbind = 1
     """
-    username = f"{USERNAME}{DOMAIN}"
+    # 真机实测（2026-11-19）：rad_user_dm 的 username 必须用不带域的纯账号，
+    # 传 "user@study" 会返回 res=some_parameter_error；前端 _logoutDm 用的
+    # userInfo.username 也是纯账号。注意与登录/查状态用的带域用户名区分。
+    username = USERNAME
     ts = int(time.time())
     unbind = 1
     sign = hashlib.sha1(
@@ -510,7 +513,11 @@ def release_device(ip=""):
     logger.info(f"请求 DM 解绑下线: ip={ip or '<空>'}")
     resp = _http_get(url, timeout=8)
     logger.debug(f"DM 解绑响应: {resp[:200]}")
-    return resp
+    # 真机返回：res=ok（成功）；res=some_parameter_error（参数错）；
+    # res=not_online_error（无在线设备，通常说明已解绑成功）；sign 错则会是 sign_error
+    ok = bool(resp) and ('"res":"ok"' in resp.replace(" ", "") or "res=ok" in resp)
+    logger.info(f"DM 解绑结果: {'成功' if ok else '未成功'}")
+    return resp, ok
 
 
 def verify_internet():
@@ -577,9 +584,14 @@ def _try_release(info, state):
         candidates = [ip]
 
     target = candidates[0]
-    release_device(target)
+    resp, ok = release_device(target)
     state["last_release"] = time.time()
-    return True, f"已解绑占用设备 {target}"
+    if ok:
+        return True, f"已解绑占用设备 {target}"
+    # not_online_error 说明目标本来就已下线，也算达成了目的
+    if resp and "not_online_error" in resp:
+        return True, f"占用设备 {target} 已不在线（无需解绑）"
+    return False, f"解绑失败: {str(resp)[:120]}"
 
 
 def _looks_occupied(msg):
@@ -629,7 +641,10 @@ def once(force=False):
     # 只有登录失败且响应疑似占用，才尝试解绑并重试一次
     if not success and _looks_occupied(msg) and AUTO_RELEASE:
         logger.warning(f"登录失败且疑似账号被占用: {msg}")
-        released, why = _try_release(info, state)
+        # 重新查一次状态：首次 portal_status 在未认证视角可能看不到占用者，
+        # 登录失败后会话信息可能刷新（路由器视角下这里能看到占用设备）
+        _, fresh_info = portal_status()
+        released, why = _try_release(fresh_info or info, state)
         logger.info(f"占用处理: {why}")
         if released:
             try:

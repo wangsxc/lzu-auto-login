@@ -243,16 +243,24 @@ end
 
 -- ==================== 占用解绑（rad_user_dm）====================
 -- sign = sha1(time .. username .. ip .. unbind .. time)，unbind=1
+-- 真机实测（2026-11-19）：
+--   * username 必须用不带域的纯账号（带 @study 返回 some_parameter_error）
+--   * 接口是 JSONP GET（前端 _logoutDm 用 ajax.jsonp），不是 POST
+--   * 成功返回 res="ok"；无在线设备返回 res="not_online_error"（也算达成目的）
 local function release_device(ip)
   local t = tostring(os.time())
-  local username = CONFIG.username .. CONFIG.domain
+  local username = CONFIG.username  -- 纯账号，不带域
   local sign = bx1.sha1_hex(t .. username .. ip .. "1" .. t)
-  local fields = {
-    ip = ip, username = username, time = t, unbind = "1", sign = sign,
-  }
-  local body = http_post("http://" .. CONFIG.portal_host .. "/cgi-bin/rad_user_dm", fields)
-  log("INFO", "DM 解绑请求 ip=" .. ip .. " 响应=" .. tostring(body and body:sub(1, 80)))
-  return true
+  local qs = "callback=jQuery&ip=" .. url_encode(ip)
+    .. "&username=" .. url_encode(username)
+    .. "&time=" .. url_encode(t) .. "&unbind=1&sign=" .. url_encode(sign)
+  local url = "http://" .. CONFIG.portal_host .. "/cgi-bin/rad_user_dm?" .. qs
+  local body = http_get(url)
+  local ok = body and (body:find('"res":"ok"', 1, true) or body:find("res=ok", 1, true))
+  local done = ok or (body and body:find("not_online_error", 1, true))
+  log("INFO", "DM 解绑 ip=" .. ip .. " 结果=" .. (done and "成功" or "未成功")
+    .. " 响应=" .. tostring(body and body:sub(1, 100)))
+  return done and true or false
 end
 
 -- 从 rad_user_info 详情里挑出"非本机"的占用设备 IP
@@ -332,17 +340,25 @@ local function recover()
     return false
   end
 
+  -- 重新查一次状态拿最新的在线设备（未认证时首次查询可能看不到占用者，
+  -- 登录失败后服务端会话信息可能刷新；路由器视角下这里能看到占用设备）
+  local _, fresh_info = portal_status()
+  local target_info = fresh_info or info
+
   local state = load_state()
-  local allowed, occ_ip = can_release(info, state)
+  local allowed, occ_ip = can_release(target_info, state)
   if not allowed then
     log("WARN", "登录疑似占用，但解绑保险未通过，不自动解绑")
     return false
   end
 
   log("WARN", "登录失败疑似占用，解绑设备 " .. occ_ip .. " 后重试一次")
-  release_device(occ_ip)
+  local released = release_device(occ_ip)
   state.last_release = os.time()
   save_state(state)
+  if not released then
+    log("WARN", "解绑接口未成功，仍尝试重试登录一次")
+  end
 
   ok, msg = login_and_verify()  -- 只重试一次，不循环
   if ok then
