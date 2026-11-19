@@ -34,7 +34,24 @@
 这是它相比电脑端最实际的价值。前提是路由器已开 SSH，且具备 `lua`、`socket.http`、`cjson`
 （OpenWrt 18.06 一般都有，本项目在小米 CR8809 上验证）。
 
-## 为什么是"重新认证"而不是"记住密码"
+## 为什么是 eLearning（@study），不是 iLZU 无感知认证
+
+学校提供两种上网方式，取舍很明确：
+
+| | iLZU 无感知认证 | eLearning（@study） |
+|---|---|---|
+| 认证方式 | 首次账密认证后把设备 MAC 绑定，之后自动放行 | 每次都要账密 + 挑战应答 |
+| 流量 | **每月 30GB** | **不限量** |
+| 掉线情况 | 绑定后基本不掉了 | 断电、重拨、被别的设备占用都会掉 |
+
+无感知认证确实省事，但流量有上限。要用不限量的那档，就只能走 eLearning；而 eLearning 的
+认证态是绑定在**出口 IP** 上的单次会话，断一次就得重新认证一次。
+
+**所以本项目要解决的不是"懒得输密码"，而是"想用不限量的 eLearning，却受不了它反复掉线"。**
+这也是它和那些做无感知认证 / 只是定时重登的脚本的根本区别 —— 后者绑定一次就长期有效，
+本项目要处理的是每次掉线之后怎么把会话快速抢回来，包括账号被别的设备占用的情况。
+
+## 认证态为什么会消失
 
 认证态绑在**出口 IP** 上，本质上是一次会话，不是一份保存在设备里的凭据。所以它会消失：
 
@@ -136,6 +153,42 @@ python tests/run_mock_test.py
 - 路由器部署用的 `router/.router_auth.json` 同理。
 - 自动解绑会踢掉同账号下的其他设备（手机、平板）。这是校园网单会话策略的必然结果，
   不想要就设 `auto_release: false`。
+
+## 相关项目
+
+同类项目不少，这里不回避：登录协议、定时重登、开机自启这套做法是通用的，很多人都写过。
+区别在于**有没有处理"账号被别的设备占用"**，以及**能不能零依赖跑在路由器上**。
+
+| 项目 | 语言 | 侧重 |
+|---|---|---|
+| [FallenSigh/LZUSrunCLI](https://github.com/FallenSigh/LZUSrunCLI) | C++ | 命令行认证工具，需编译 |
+| [HollowMan6/Srun-LZU-Network-Auth](https://github.com/HollowMan6/Srun-LZU-Network-Auth) | Python | 早期 CLI，login / logout / info |
+| [hanzif1/LZU_school_net_auto_login](https://github.com/hanzif1/LZU_school_net_auto_login) | Python + 浏览器驱动 | 用 Selenium 驱动真实浏览器，Windows 专用 |
+| [EnableVoika/iLZU-Auto-Login](https://github.com/EnableVoika/iLZU-Auto-Login) | Python | 面向路由器场景，但需要 Python 运行环境 |
+| [LYCaikano/lzunet](https://github.com/LYCaikano/lzunet) | Python | 深澜接口逆向文档 + 自助服务只读查询 |
+| [zu1k/srun](https://github.com/zu1k/srun) | Rust | 通用深澜客户端，支持多拨、自动探测 IP |
+
+与它们的差异主要是两点：
+
+- **占用自动解除。** 以上项目遇到 `E2620: You are already online.` 一般只能重试或等待。
+  本项目会经自助服务列出账号下全部在线设备，再按 IP 注销占用者后重登。
+- **原生 Lua、零依赖。** 路由器端只用固件自带的 `lua` + `socket.http` + `cjson`，
+  不需要 Entware、不需要 Python，适合 overlay 只有十几 MB 的机器。
+
+## 适用范围与已知限制
+
+- **主要面向 `@study`（eLearning）账号。** 该账号并发会话数为 **1**，任意两台设备都会
+  互相顶掉，这正是解绑功能存在的场景。
+- **普通账号（`@lzu.edu.cn` / `@ilzu`）通常有 3 个并发名额**，很少撞上 `E2620`，
+  解绑功能基本用不到；此时把 `auto_release` 设为 `false` 更稳妥。
+- **开了无感知认证（MAC 绑定）的设备，解绑可能无效。** 无感知会话被注销后，
+  MacAuth 可能在数秒内重新建立会话，表现为"`logout` 返回成功但实际没下线"。
+  这类情况下改用 `rad_user_dm` + `unbind=1` 才有效 —— 该结论来自同类项目的实测记录
+  （[LYCaikano/lzunet](https://github.com/LYCaikano/lzunet)，场景是宿舍区 `@ilzu` +
+  无感知认证）。本项目的 `logout` 方案在 `@study` 场景下双向验证通过，
+  但**未在开启无感知认证的账号上验证过**。
+- 电脑端只在 `target_ssids` 列出的无线网下工作；路由器端要求能访问内网 Portal。
+- 流量配额（如 iLZU 每月 30GB）由学校规定，可能随时调整，以官方为准。
 
 ## 说明
 
