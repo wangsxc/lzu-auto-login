@@ -70,8 +70,10 @@ local function log(level, msg)
   if log_fp then
     log_fp:write(line)
     log_fp:flush()
-    -- 超过 1MB 轮转
-    if log_fp:seek("end") > 1048576 then
+    -- 轮转：达阈值就滚动一代（.1）。默认 256KB，即日志总量封顶约 512KB，
+    -- 相对 /overlay 十几 MB 的空余是很保守的值，长期常驻也不会撑爆。
+    local limit = CONFIG.log_max_bytes or 262144
+    if log_fp:seek("end") > limit then
       log_fp:close()
       os.execute("mv -f " .. LOG_FILE .. " " .. LOG_FILE .. ".1 2>/dev/null")
       log_fp = io.open(LOG_FILE, "a")
@@ -173,7 +175,9 @@ local function internet_ok()
     local body = http_get(url)
     if body then
       local expect = CONFIG.probe_expect[i]
-      if expect == nil then
+      -- cjson 把 JSON 的 null 解成 json.null（lightuserdata），它既不是 nil
+      -- 也不是字符串，直接送去 string.find 会报错，必须显式判等。
+      if expect == nil or expect == json.null then
         -- 无正文要求：只要非劫持（正文不含 Portal 特征）即算通
         if not body:find("srun_portal", 1, true) and not body:find("10.10.0.166", 1, true) then
           return true
@@ -367,7 +371,7 @@ local function recover()
     return false
   end
 
-  log("WARN", "登录失败疑似占用，尝试注销占用会话")
+  log("WARN", "登录失败疑似占用，尝试注销占用会话（服务端返回: " .. tostring(msg) .. "）")
   local state = load_state()
   local released, why = try_release(info, state)
   log("INFO", "占用处理: " .. tostring(why))

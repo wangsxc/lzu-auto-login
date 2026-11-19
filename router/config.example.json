@@ -19,5 +19,6 @@
   "self_service_base": "https://login.lzu.edu.cn:8800",
   "poll_intervals": [60, 120, 300, 600, 900],
   "backoff": [60, 120, 240, 480, 900],
-  "http_timeout": 6
+  "http_timeout": 6,
+  "log_max_bytes": 262144
 }

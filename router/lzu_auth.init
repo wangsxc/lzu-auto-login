@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+# 兰大校园网自动认证（路由器常驻版）
+# 安装：cp 到 /etc/init.d/lzu_auth && chmod +x && /etc/init.d/lzu_auth enable
+# 管理：/etc/init.d/lzu_auth start|stop|restart|status
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/lua
+SCRIPT=/overlay/lzu/lzu_auth.lua
+
+start_service() {
+    # 脚本自己写 /overlay/lzu/lzu_auth.log，这里不重定向到 syslog，避免双份
+    procd_open_instance
+    procd_set_param command "$PROG" "$SCRIPT" run
+    procd_set_param respawn 3600 5 30
+    procd_set_param limits nofile="256"
+    procd_set_param stdout 0
+    procd_set_param stderr 0
+    procd_close_instance
+}

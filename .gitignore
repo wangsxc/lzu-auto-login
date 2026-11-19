@@ -34,3 +34,7 @@ router/_telnet_run.py
 router/_test_vector.lua
 router/_test_selfsvc.lua
 router/state.json
+
+# 路由器部署辅助（含设备密码 / 隔离安装的 SSH 库，严禁入库）
+router/_vendor/
+router/.router_auth.json
