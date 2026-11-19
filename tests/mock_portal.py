@@ -286,10 +286,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._send("not found", "text/plain", 404)
 
         if get("action") == "logout":
-            STATE.state = "offline"
-            STATE.challenge = ""
-            STATE.record("logout")
-            return self._send("logout_ok")
+            # 真机行为：按 ip 参数查会话，与请求来源无关。
+            # 不存在的 IP -> login_error#You are not online.
+            target = get("ip")
+            live_ip = ""
+            if STATE.state == "online":
+                live_ip = CLIENT_IP
+            elif STATE.state == "occupied":
+                live_ip = "10.99.0.88"
+            elif STATE.state == "self_occupied":
+                live_ip = CLIENT_IP
+            if target and target == live_ip:
+                STATE.state = "offline"
+                STATE.challenge = ""
+                # 会话被注销后，"强制不通"的模拟也应随之结束（重登后恢复）
+                STATE.internet_override = None
+                STATE.record("logout", ip=target, ok=True)
+                return self._send("logout_ok")
+            STATE.record("logout", ip=target, ok=False)
+            return self._send("login_error#You are not online.")
 
         token = STATE.challenge
         hmac_hex = hmac.new(

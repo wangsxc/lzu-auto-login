@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""自助服务解绑模块：用账密 SSO 免登录 8800，从任意设备踢掉占用者。
+"""自助服务模块：用账密 SSO 免登录 8800，列出账号下全部在线设备。
 
 深澜自助服务 https://login.lzu.edu.cn:8800 用独立 PHP 会话（账密认证），
 与网络来源 IP 无关，因此即使本机未认证，只要能访问 8800 就能登录并看到
-账号下全部在线设备，踢掉任意一个 —— 这正是 rad_user_dm 做不到的
-（rad_user_dm/rad_user_info 都按来源 IP 判断，未认证时看不到别的设备）。
+账号下全部在线设备 —— 这正是 rad_user_info 做不到的（后者按来源 IP
+判断，未认证时只会返回 not_online_error）。
 
-链路（从 Portal.js 的 toSelfService / 8800 登录页逆向 + 真机验证 2026-11-19）：
-    1. GET /site/sso?data=base64("zh-CN:<账号>:<md5(密码)>")
+主程序只用它做一件事：**列出在线设备 IP**，再交给 srun_portal 的
+action=logout 按 IP 注销（那个才真的踢得掉）。
+
+注意：本模块的 kick_device()（POST /home/delete）在真机上对 @study 产品
+一律返回「下线请求失败」，是服务端业务层拒绝，不是参数问题
+（GET 会 405，POST 带 _csrf-8800 也不行）。因此它只是备用路径。
+
+链路：
+    1. GET /site/sso?data=base64("zh-CN:<账号>:<md5(密码))")
        -> 免图形验证码、免 RSA，302 到 /home，拿到 PHPSESSID_8800
     2. GET /home -> 解析在线设备表格：
        每行 <tr data-key="<id>">，含 IP、产品名称，
-       及 <a href="/home/delete?id=<id>&user_mac=<mac>" ... title="下线">
+       及 <a href="/home/delete?id=<id>&user_mac=<mac>" data-method="post">
        同时拿到 <input name="_csrf-8800" value="...">
     3. POST /home/delete?id=<id>&user_mac=<mac>（带 _csrf-8800）
-       -> 下线该设备
 
 本模块不记录密码，不打印响应正文中的敏感内容。
 """
@@ -29,6 +35,8 @@ import urllib.request
 
 DEFAULT_BASE = "https://login.lzu.edu.cn:8800"
 SELF_HOST = "login.lzu.edu.cn"
+# 自助服务下线失败时页面上的 flash 提示（Yii2 flash message）
+_KICK_FAIL_HINT = "下线请求失败"
 
 
 class SelfServiceClient:
@@ -117,21 +125,35 @@ class SelfServiceClient:
         return devices
 
     def kick_device(self, device):
-        """下线指定设备。device 来自 list_devices()。返回 (ok, msg)。"""
+        """下线指定设备。device 来自 list_devices()。返回 (ok, msg)。
+
+        失败判据必须看响应正文：服务端无论成功失败都会 302/跳回 /home，
+        所以判定 URL 会永远"成功"（此前就是这样误报的）。
+        自助服务失败时页面带一句 flash：「下线请求失败」。
+        """
         if not device or not device.get("delete_path"):
             return False, "设备无下线链接"
         if not self.csrf:
             html, _ = self._get("/home")
             self._extract_csrf(html)
-        # 解析 delete_path 的参数
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(device["delete_path"]).query)
-        data = {"id": qs.get("id", [device.get("id", "")])[0],
-                "user_mac": qs.get("user_mac", [device.get("user_mac", "")])[0]}
-        if self.csrf:
-            data["_csrf-8800"] = self.csrf
-        _, final = self._post("/home/delete", data)
-        ok = "home" in final or "delete" not in final
-        return ok, ("已下线" if ok else "下线请求未确认")
+        # 解析 delete_path 的参数（页面里是 &amp; 转义，先还原）
+        path = device["delete_path"].replace("&amp;", "&")
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        params = {"id": qs.get("id", [device.get("id", "")])[0],
+                  "user_mac": qs.get("user_mac", [device.get("user_mac", "")])[0]}
+
+        body, _ = self._post("/home/delete", dict(params))
+        if _KICK_FAIL_HINT in body:
+            return False, "下线请求失败（服务端拒绝，未生效）"
+
+        # 不信响应，回读在线设备列表确认真的消失
+        try:
+            still = [d for d in self.list_devices() if d.get("id") == str(params["id"])]
+        except Exception:
+            still = []
+        if still:
+            return False, "下线后设备仍在线"
+        return True, "已下线"
 
 
 def release_occupant(username, password, own_ip="", log=None, base=DEFAULT_BASE):

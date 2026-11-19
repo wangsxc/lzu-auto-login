@@ -241,14 +241,38 @@ local function srun_login()
   return false, err
 end
 
--- ==================== 占用解绑（自助服务账密 SSO）====================
--- rad_user_dm / rad_user_info 都按来源 IP 判断，未认证时看不到占用者，
--- 所以改用自助服务账密会话（与来源 IP 无关，能看到账号下全部设备）。
+-- ==================== 占用解绑 ====================
+-- 真机实测（2026-11-19）：
+--   1. 账密 SSO 登录 8800 可列出账号下全部在线设备（与来源 IP 无关）
+--   2. 拿到 IP 后，srun_portal 的 action=logout 按 ip 参数查会话、
+--      不校验来源 IP —— 这才是真正能踢掉占用的接口
+--   3. rad_user_dm 在 golang 新版上 sign 规则变了（长期 sign_error），
+--      8800 的 /home/delete 对 @study 一律「下线请求失败」，都不可用
 -- 详见 self_service.lua。真机验证 2026-11-19。
 local selfsvc = require("self_service")
 
--- 解绑三道保险 + 执行解绑，返回 (是否解绑, 说明)
-local function try_release(info, state)
+-- 注销指定 IP 的在线会话
+local function srun_logout_ip(ip)
+  if not ip or ip == "" then return false, "空 IP" end
+  log("INFO", "注销会话: ip=" .. ip)
+  local body, code = http_post("http://" .. CONFIG.portal_host .. "/cgi-bin/srun_portal", {
+    action = "logout",
+    username = CONFIG.username .. CONFIG.domain,
+    ac_id = CONFIG.ac_id,
+    ip = ip,
+  })
+  if not body then return false, "注销请求失败 code=" .. tostring(code) end
+  if body:match("^logout_ok") then
+    log("INFO", "注销成功: " .. ip)
+    return true, "logout_ok"
+  end
+  log("WARN", "注销未成功: " .. ip .. " -> " .. body:sub(1, 80))
+  return false, body:sub(1, 80)
+end
+
+-- 解绑三道保险 + 执行解绑，返回 (是否真的注销了会话, 说明)
+-- own_ip_override: 传 "" 表示本机探测已确认不通，允许注销 online_ip 自己
+local function try_release(info, state, own_ip_override)
   if not CONFIG.auto_release then return false, "自动解绑已关闭" end
   -- 保险 1：本机已能联网
   if internet_ok() then
@@ -260,11 +284,33 @@ local function try_release(info, state)
     return false, "距上次解绑不足 " .. CONFIG.release_cooldown .. "s"
   end
 
-  local own_ip = (info and info.online_ip) or ""
   local base = CONFIG.self_service_base or "https://login.lzu.edu.cn:8800"
-  local ok, why = selfsvc.release_occupant(base, CONFIG.username, CONFIG.password, own_ip,
+  local ips, err = selfsvc.list_ips(base, CONFIG.username, CONFIG.password,
     function(m) log("INFO", "[自助服务] " .. m) end)
-  return ok, why
+  if not ips then return false, tostring(err) end
+
+  -- 保险 3：排除本机
+  local own_ip = own_ip_override
+  if own_ip == nil then own_ip = (info and info.online_ip) or "" end
+  local targets = {}
+  for _, ip in ipairs(ips) do
+    if ip ~= "" and ip ~= own_ip then targets[#targets + 1] = ip end
+  end
+  if #targets == 0 then
+    return false, "在线设备只有本机或无设备，拒绝解绑"
+  end
+
+  log("INFO", "待注销会话: " .. table.concat(targets, ","))
+  local kicked = {}
+  for _, ip in ipairs(targets) do
+    local ok = srun_logout_ip(ip)
+    if ok then kicked[#kicked + 1] = ip end
+    socket.sleep(0.5)
+  end
+  if #kicked == 0 then
+    return false, "注销失败（" .. table.concat(targets, "/") .. "）：Portal 未确认下线"
+  end
+  return true, "已注销占用会话: " .. table.concat(kicked, ",")
 end
 
 -- ==================== 登录 + 联网验证（成功判定）====================
@@ -283,9 +329,24 @@ end
 local function recover()
   local online, info = portal_status()
 
-  -- 情况 A：服务端说已认证，但探测失败 —— 探测服务问题，不登录不解绑
+  -- 情况 A：服务端说已认证，但探测失败 —— 复核一次，仍不通就注销该会话重登
   if online then
-    log("INFO", "rad_user_info 显示已认证但外网探测失败，等待下轮（不登录）")
+    socket.sleep(1)
+    if internet_ok() then return true end
+    log("WARN", "已认证但探测不通（复核仍失败），注销会话 "
+      .. tostring(info and info.online_ip) .. " 后重登")
+    local state = load_state()
+    local released, why = try_release(info, state, "")
+    log("INFO", "占用处理: " .. tostring(why))
+    if released then
+      state.last_release = os.time()
+      save_state(state)
+      socket.sleep(1.5)
+      if login_and_verify() then
+        log("INFO", "注销后重登成功")
+        return true
+      end
+    end
     return false
   end
 
@@ -306,19 +367,22 @@ local function recover()
     return false
   end
 
-  log("WARN", "登录失败疑似占用，尝试通过自助服务解绑占用设备")
+  log("WARN", "登录失败疑似占用，尝试注销占用会话")
   local state = load_state()
   local released, why = try_release(info, state)
   log("INFO", "占用处理: " .. tostring(why))
-  state.last_release = os.time()
-  save_state(state)
-
-  ok, msg = login_and_verify()  -- 无论解绑结果如何，都重试登录一次
-  if ok then
-    log("INFO", "解绑后重试登录成功")
-    return true
+  if released then
+    state.last_release = os.time()
+    save_state(state)
+    socket.sleep(1.5)  -- 给服务端清理会话留时间
+    ok, msg = login_and_verify()
+    if ok then
+      log("INFO", "注销后重登成功")
+      return true
+    end
+    log("WARN", "注销后重登仍失败: " .. tostring(msg))
+    return false
   end
-  log("WARN", "解绑后重试仍失败: " .. tostring(msg))
   return false
 end
 

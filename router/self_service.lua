@@ -124,7 +124,31 @@ function M.kick_device(base, cookie_jar, csrf, device)
 end
 
 --[[
-完整解绑：登录 -> 列设备 -> 踢掉非本机设备。
+只列在线设备 IP（账密 SSO）。这是主程序真正需要的唯一能力：
+拿到占用者 IP 后交给 srun_portal 的 action=logout 注销。
+
+真机实测：logout 按 ip 参数查会话、不校验来源 IP，任何设备都能踢；
+而本模块的 /home/delete 对 @study 产品一律返回「下线请求失败」，
+所以 kick_device 只作备用。
+
+返回 ips 表, 或 nil + 原因。
+]]
+function M.list_ips(base, username, password, logf)
+  local log = logf or function() end
+  local jar, err = M.login(base, username, password)
+  if not jar then return nil, "自助服务登录失败: " .. tostring(err) end
+  local devices = M.list_devices(base, jar)
+  os.remove(jar)
+  local ips = {}
+  for _, d in ipairs(devices) do
+    if d.ip and d.ip ~= "" then ips[#ips + 1] = d.ip end
+  end
+  log("在线设备: " .. (#ips > 0 and table.concat(ips, ",") or "无"))
+  return ips
+end
+
+--[[
+完整解绑（旧路径，备用）：登录 -> 列设备 -> 踢掉非本机设备。
 own_ip: 本机在服务端眼中的 IP（排除自己）。
 返回 ok, 说明。
 ]]

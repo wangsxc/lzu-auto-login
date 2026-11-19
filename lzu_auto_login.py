@@ -14,8 +14,10 @@ LZU/iLZU 校园网自动登录脚本（深澜 srun V1.18 协议）
       先判断是否在目标网络，立即跑一次；随后 5 分钟每分钟一次，
       再后 30 分钟每 10 分钟一次，共 9 次后进程退出。
       每轮流程：已认证 -> 验联网；未认证 -> 先直接登录；
-      仅当登录失败且确认是占用，才用账密 SSO 登录自助服务列出在线设备、
-      踢掉占用者并重试（账密会话与来源 IP 无关，能看到别的设备）；
+      仅当登录失败且确认是占用，才用账密 SSO 登录自助服务列出账号下
+      全部在线设备，再用 srun_portal 的 action=logout 按 IP 注销占用会话
+      （实测 logout 只按 ip 参数查会话、不校验来源 IP，任何设备都能踢），
+      然后重试登录；
       服务端返回登录成功不算数，必须本机联网验证通过才算成功。
       解绑前若本机已能联网、冷却未过、或在线设备就是本机，一律拒绝，
       避免"自己把自己占用了又自己解除"的循环。
@@ -488,38 +490,60 @@ _OCCUPY_HINTS = (
 )
 
 
-def release_device(ip=""):
-    """调用 /cgi-bin/rad_user_dm 解绑（踢下线）指定 IP 的在线设备。
+def release_device(ip):
+    """注销指定 IP 的在线会话 —— 这才是真正可用的"解除占用"。
 
-    参数与 Portal.js 的 _logoutDm 一致：
-        sign = sha1(time + username + ip + unbind + time), unbind = 1
+    真机实测（2026-11-19）：srun_portal 的 action=logout 是按 **ip 参数**
+    查会话的，完全不校验请求来源 IP。传一个不存在的 IP 会返回
+    "login_error#You are not online."，而此刻本机来源 IP 明明在线。
+    所以从任何设备都能注销任意 IP 的会话，且不需要 sign / cookie / CSRF。
+
+    对比另外两条路（都已实测走不通）：
+      - rad_user_dm：2026-07 升级 golang 版后 sign 规则变了，长期 sign_error
+      - 8800 自助服务 /home/delete：对 @study 产品一律返回「下线请求失败」
+
+    注意 username 必须带域（与登录一致），这点与 rad_user_dm 相反。
     """
-    # 真机实测（2026-11-19）：rad_user_dm 的 username 必须用不带域的纯账号，
-    # 传 "user@study" 会返回 res=some_parameter_error；前端 _logoutDm 用的
-    # userInfo.username 也是纯账号。注意与登录/查状态用的带域用户名区分。
-    username = USERNAME
-    ts = int(time.time())
-    unbind = 1
-    sign = hashlib.sha1(
-        f"{ts}{username}{ip}{unbind}{ts}".encode()
-    ).hexdigest()
-    params = {
-        "callback": "jQuery",
-        "ip": ip,
-        "username": username,
-        "time": str(ts),
-        "unbind": str(unbind),
-        "sign": sign,
-    }
-    url = f"http://{PORTAL_HOST}/cgi-bin/rad_user_dm?" + urllib.parse.urlencode(params)
-    logger.info(f"请求 DM 解绑下线: ip={ip or '<空>'}")
-    resp = _http_get(url, timeout=8)
-    logger.debug(f"DM 解绑响应: {resp[:200]}")
-    # 真机返回：res=ok（成功）；res=some_parameter_error（参数错）；
-    # res=not_online_error（无在线设备，通常说明已解绑成功）；sign 错则会是 sign_error
-    ok = bool(resp) and ('"res":"ok"' in resp.replace(" ", "") or "res=ok" in resp)
-    logger.info(f"DM 解绑结果: {'成功' if ok else '未成功'}")
+    if not ip:
+        return "", False
+    username = f"{USERNAME}{DOMAIN}"
+    logger.info(f"注销会话: ip={ip}")
+    try:
+        resp = _http_post(f"http://{PORTAL_HOST}/cgi-bin/srun_portal", {
+            "action": "logout",
+            "username": username,
+            "ac_id": AC_ID,
+            "ip": ip,
+        })
+    except Exception as e:
+        logger.warning(f"注销请求异常: {e}")
+        return str(e), False
+    logger.debug(f"注销响应: {resp[:200]}")
+    ok = resp.startswith("logout_ok")
+    logger.info(f"注销结果: {'成功' if ok else resp[:80]}")
     return resp, ok
+
+
+def list_online_ips():
+    """用账密 SSO 登录自助服务，列出账号下全部在线设备的 IP。
+
+    这条链路与来源 IP 无关（真机验证），是本机未认证时唯一能看到
+    占用者的途径 —— rad_user_info 此时只会返回 not_online_error。
+    """
+    try:
+        from self_service import SelfServiceClient
+        cli = SelfServiceClient(USERNAME, PASSWORD, base=SELF_SERVICE_BASE)
+        ok, msg = cli.login()
+        if not ok:
+            logger.warning(f"[自助服务] 登录失败: {msg}")
+            return []
+        devs = cli.list_devices()
+        ips = [d.get("ip", "") for d in devs if d.get("ip")]
+        logger.info("[自助服务] 在线设备: " + (", ".join(ips) or "无"))
+        return ips
+    except Exception as e:
+        logger.error(f"[自助服务] 列设备异常: {e}")
+        return []
 
 
 def verify_internet():
@@ -552,20 +576,21 @@ def verify_internet():
     return False
 
 
-def _try_release(info, state):
-    """仅在登录失败且疑似占用时调用；返回 (是否解绑, 说明)。
+def _try_release(known_ip="", state=None):
+    """仅在登录失败且确认占用时调用；返回 (是否真的注销了会话, 说明)。
 
-    用自助服务账密 SSO（self_service.py）拿到账号下全部在线设备再踢占用者，
-    而不是 rad_user_info —— 后者按来源 IP 判断，未认证时看不到别人的会话。
-    自助服务是账密会话，与来源 IP 无关，任何设备都能踢掉占用者（真机验证）。
+    步骤：账密 SSO 列出账号下全部在线设备 -> 对每台非本机设备调用
+    logout 注销 -> 只有返回 logout_ok 才算真踢掉（不再看 URL 猜成功）。
 
     三道保险，防止"自己把自己踢下线"再自己解一遍：
       1. 本机当前能联网        -> 绝不解除
-      2. 距上次解绑太近        -> 不重复解除
-      3. 账密视角下在线设备只有本机 IP -> 绝不解除
+      2. 距上次成功解绑太近    -> 不重复解除
+      3. 在线设备只有本机 IP   -> 绝不解除
     """
     if not AUTO_RELEASE:
         return False, "自动解绑已关闭"
+    state = state if isinstance(state, dict) else {}
+
     if verify_internet():
         return False, "本机当前可联网，判定为未占用，拒绝解绑"
 
@@ -573,18 +598,26 @@ def _try_release(info, state):
     if RELEASE_COOLDOWN > 0 and time.time() - last < RELEASE_COOLDOWN:
         return False, f"距上次解绑不足 {RELEASE_COOLDOWN}s，跳过"
 
-    # 账密登录自助服务，拿到全量在线设备（关键：能看到占用者）
-    try:
-        from self_service import release_occupant
-        own = LAST_CLIENT_IP or ""
-        ok, why = release_occupant(USERNAME, PASSWORD, own_ip=own, base=SELF_SERVICE_BASE,
-                                   log=lambda m: logger.info(f"[自助服务] {m}"))
-    except Exception as e:
-        logger.error(f"自助服务解绑异常: {e}")
-        return False, f"自助服务解绑异常: {e}"
+    ips = list_online_ips()
+    if not ips and known_ip:
+        ips = [known_ip]
+    own = LAST_CLIENT_IP
+    targets = [ip for ip in ips if ip and ip != own]
+    if not targets:
+        return False, "在线设备只有本机或无设备，拒绝解绑"
 
+    logger.info(f"待注销会话: {', '.join(targets)}（本机 IP: {own or '未知'}）")
+    kicked = []
+    for ip in targets:
+        _, ok = release_device(ip)
+        if ok:
+            kicked.append(ip)
+        time.sleep(0.5)
+
+    if not kicked:
+        return False, f"注销失败（{'/'.join(targets)}）：Portal 未确认下线"
     state["last_release"] = time.time()
-    return ok, why
+    return True, f"已注销占用会话: {', '.join(kicked)}"
 
 
 def _looks_occupied(msg):
@@ -606,17 +639,43 @@ def once(force=False):
     if not can_reach(PORTAL_HOST):
         return True, f"未接入校园网（{PORTAL_HOST} 不可达），跳过"
 
+    state = _read_state()
     online, info = portal_status()
     if online is None:
         return False, "认证状态查询失败"
+
     if online:
         if verify_internet():
             logger.info(f"已认证 online_ip={info.get('online_ip')}，本机联网正常，退出。")
             return True, "已在线（联网正常）"
-        logger.warning("已认证但本机联网验证失败；不做任何解绑，等下轮重试")
-        return False, "已认证但联网异常"
+        # 已认证但本机上不了网：多半是会话挂在别的 IP 上（IP 漂移/别的设备），
+        # 或刚断线还在抖。复核一次再决定，避免误踢。
+        logger.warning("已认证但本机联网不通，复核一次...")
+        time.sleep(1)
+        if verify_internet():
+            logger.info(f"复核通过，online_ip={info.get('online_ip')}，退出。")
+            return True, "已在线（复核通过）"
+        online_ip = info.get("online_ip") or ""
+        logger.warning(f"确认本机联网异常，注销该会话（ip={online_ip or '未知'}）后重登")
+        released, why = _try_release(online_ip, state)
+        logger.info(f"占用处理: {why}")
+        if not released:
+            state.update({"fail_count": int(state.get("fail_count", 0)) + 1,
+                          "last_fail": time.time()})
+            _write_state(state)
+            return False, f"已认证但联网异常；{why}"
+        time.sleep(1.5)
+        try:
+            success, msg = srun_login()
+        except Exception as e:
+            logger.error(f"注销后重登失败: {e}")
+            success, msg = False, str(e)
+        if success and verify_internet():
+            logger.info("注销后重登成功，联网验证通过")
+            _write_state({"last_release": state.get("last_release", 0)})
+            return True, "注销占用后重登成功"
+        return False, msg
 
-    state = _read_state()
     fails = int(state.get("fail_count", 0))
     if not force and state.get("last_fail") and RETRY_BACKOFF:
         wait = RETRY_BACKOFF[min(max(fails - 1, 0), len(RETRY_BACKOFF) - 1)]
@@ -631,15 +690,13 @@ def once(force=False):
         logger.error(f"登录异常: {e}", exc_info=True)
         success, msg = False, str(e)
 
-    # 只有登录失败且响应疑似占用，才尝试解绑并重试一次
+    # 只有登录失败且响应疑似占用，才注销占用会话并重试一次
     if not success and _looks_occupied(msg) and AUTO_RELEASE:
         logger.warning(f"登录失败且疑似账号被占用: {msg}")
-        # 重新查一次状态：首次 portal_status 在未认证视角可能看不到占用者，
-        # 登录失败后会话信息可能刷新（路由器视角下这里能看到占用设备）
-        _, fresh_info = portal_status()
-        released, why = _try_release(fresh_info or info, state)
+        released, why = _try_release("", state)
         logger.info(f"占用处理: {why}")
         if released:
+            time.sleep(1.5)  # 给服务端清理会话留出时间
             try:
                 success, msg = srun_login()
             except Exception as e:

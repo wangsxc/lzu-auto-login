@@ -96,11 +96,11 @@ def main():
         ok &= check("掉线后重新登录成功", code == 0 and st["authenticated"] is True)
         ok &= check("累计登录 2 次", st["login_count"] == 2, f"count={st['login_count']}")
 
-        print("3) 模拟账号被手机占用 -> 先直接登录失败，再解绑重试并验联网")
+        print("3) 模拟账号被手机占用 -> 先直接登录失败，再注销占用会话并重试")
         control("occupied")
         code, out = run_client()
         st = http_json("/__state")
-        dm = [h for h in st["history"] if h["event"] == "home_delete"]
+        logouts = [h for h in st["history"] if h["event"] == "logout"]
         sso = [h for h in st["history"] if h["event"] == "sso_login"]
         logins = [h for h in st["history"] if h["event"] == "login"]
         ok &= check("退出码 0", code == 0, f"code={code}")
@@ -109,15 +109,28 @@ def main():
         ))
         seq = [h["event"] for h in st["history"]]
         first_login = next((i for i, e in enumerate(seq) if e == "login"), -1)
-        first_dm = next((i for i, e in enumerate(seq) if e == "home_delete"), -1)
-        ok &= check("登录失败后才调用解绑", 0 <= first_login < first_dm,
-                    f"login@{first_login} dm@{first_dm}")
+        first_logout = next((i for i, e in enumerate(seq) if e == "logout"), -1)
+        ok &= check("登录失败后才注销占用会话", 0 <= first_login < first_logout,
+                    f"login@{first_login} logout@{first_logout}")
         ok &= check("自助服务账密 SSO 登录成功", bool(sso) and all(h.get("ok") for h in sso))
-        ok &= check("解绑的是占用设备 IP", any(h.get("ip") == "10.99.0.88" for h in dm))
-        ok &= check("解绑后重新登录成功", any(h["result"] == "login_ok" for h in logins))
+        ok &= check("注销的是占用设备 IP 且返回 logout_ok",
+                    any(h.get("ip") == "10.99.0.88" and h.get("ok") for h in logouts))
+        ok &= check("注销后重新登录成功", any(h["result"] == "login_ok" for h in logins))
         ok &= check("登录成功后联网验证通过", "联网验证通过" in out)
         ok &= check("最终已认证", st["authenticated"] is True)
         ok &= check("累计登录 3 次", st["login_count"] == 3, f"count={st['login_count']}")
+
+        print("3b) 已认证但本机联网不通 -> 注销该会话后重登")
+        control("online", internet=0)
+        code, out = run_client()
+        st = http_json("/__state")
+        logouts = [h for h in st["history"] if h["event"] == "logout"]
+        ok &= check("注销了当前会话", any(h.get("ip") == "10.99.0.7" and h.get("ok")
+                                          for h in logouts))
+        ok &= check("注销后重登成功", "注销占用后重登成功" in out or "重登成功" in out,
+                    out[:120])
+        control("online", internet="auto")
+        ok &= check("最终已认证", http_json("/__state")["authenticated"] is True)
 
         print("4) rad_user_info 状态查询")
         control("online")
