@@ -633,7 +633,12 @@ def once(force=False):
     """
     if SSID_FILTER:
         ssid = get_windows_ssid()
-        if ssid not in TARGET_SSIDS:
+        if not ssid:
+            # 读不到 SSID：可能是有线直连（例如网线接宿舍千兆网口），也可能是
+            # 无线网卡被禁用。这种情况不该按 WiFi 名拦截，交给下面的 Portal
+            # 可达性判断 —— Portal 是校园网内网地址，不在校园网时根本不可达。
+            logger.info("未读到 WiFi SSID（可能为有线连接），跳过 SSID 过滤，改按 Portal 可达性判断")
+        elif ssid not in TARGET_SSIDS:
             return True, f"非目标网络（{ssid}），跳过"
 
     if not can_reach(PORTAL_HOST):
