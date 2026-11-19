@@ -241,64 +241,30 @@ local function srun_login()
   return false, err
 end
 
--- ==================== 占用解绑（rad_user_dm）====================
--- sign = sha1(time .. username .. ip .. unbind .. time)，unbind=1
--- 真机实测（2026-11-19）：
---   * username 必须用不带域的纯账号（带 @study 返回 some_parameter_error）
---   * 接口是 JSONP GET（前端 _logoutDm 用 ajax.jsonp），不是 POST
---   * 成功返回 res="ok"；无在线设备返回 res="not_online_error"（也算达成目的）
-local function release_device(ip)
-  local t = tostring(os.time())
-  local username = CONFIG.username  -- 纯账号，不带域
-  local sign = bx1.sha1_hex(t .. username .. ip .. "1" .. t)
-  local qs = "callback=jQuery&ip=" .. url_encode(ip)
-    .. "&username=" .. url_encode(username)
-    .. "&time=" .. url_encode(t) .. "&unbind=1&sign=" .. url_encode(sign)
-  local url = "http://" .. CONFIG.portal_host .. "/cgi-bin/rad_user_dm?" .. qs
-  local body = http_get(url)
-  local ok = body and (body:find('"res":"ok"', 1, true) or body:find("res=ok", 1, true))
-  local done = ok or (body and body:find("not_online_error", 1, true))
-  log("INFO", "DM 解绑 ip=" .. ip .. " 结果=" .. (done and "成功" or "未成功")
-    .. " 响应=" .. tostring(body and body:sub(1, 100)))
-  return done and true or false
-end
+-- ==================== 占用解绑（自助服务账密 SSO）====================
+-- rad_user_dm / rad_user_info 都按来源 IP 判断，未认证时看不到占用者，
+-- 所以改用自助服务账密会话（与来源 IP 无关，能看到账号下全部设备）。
+-- 详见 self_service.lua。真机验证 2026-11-19。
+local selfsvc = require("self_service")
 
--- 从 rad_user_info 详情里挑出"非本机"的占用设备 IP
-local function find_occupant_ip(info)
-  if not info or not info.online_device_detail then return nil end
-  local ok, detail = pcall(json.decode, info.online_device_detail)
-  if not ok or type(detail) ~= "table" then return nil end
-  -- 本机 WAN IP 不作为占用设备
-  local own_ip = info.online_ip or ""
-  for _, dev in pairs(detail) do
-    if type(dev) == "table" and dev.ip and dev.ip ~= "" and dev.ip ~= own_ip then
-      return dev.ip
-    end
-  end
-  return nil
-end
-
--- 解绑三道保险，返回是否允许解绑
-local function can_release(info, state)
-  if not CONFIG.auto_release then return false end
-  -- 保险 1：本机已能联网 —— 没被占用
+-- 解绑三道保险 + 执行解绑，返回 (是否解绑, 说明)
+local function try_release(info, state)
+  if not CONFIG.auto_release then return false, "自动解绑已关闭" end
+  -- 保险 1：本机已能联网
   if internet_ok() then
-    log("INFO", "拒绝解绑：本机已能联网")
-    return false
+    return false, "本机当前可联网，拒绝解绑"
   end
   -- 保险 2：冷却期内
   local last = tonumber(state.last_release) or 0
   if os.time() - last < CONFIG.release_cooldown then
-    log("INFO", "拒绝解绑：距上次解绑不足 " .. CONFIG.release_cooldown .. "s")
-    return false
+    return false, "距上次解绑不足 " .. CONFIG.release_cooldown .. "s"
   end
-  -- 保险 3：在线设备只有本机（无其他占用者）
-  local occ = find_occupant_ip(info)
-  if not occ then
-    log("INFO", "拒绝解绑：在线设备中没有其他占用者")
-    return false
-  end
-  return true, occ
+
+  local own_ip = (info and info.online_ip) or ""
+  local base = CONFIG.self_service_base or "https://login.lzu.edu.cn:8800"
+  local ok, why = selfsvc.release_occupant(base, CONFIG.username, CONFIG.password, own_ip,
+    function(m) log("INFO", "[自助服务] " .. m) end)
+  return ok, why
 end
 
 -- ==================== 登录 + 联网验证（成功判定）====================
@@ -340,27 +306,14 @@ local function recover()
     return false
   end
 
-  -- 重新查一次状态拿最新的在线设备（未认证时首次查询可能看不到占用者，
-  -- 登录失败后服务端会话信息可能刷新；路由器视角下这里能看到占用设备）
-  local _, fresh_info = portal_status()
-  local target_info = fresh_info or info
-
+  log("WARN", "登录失败疑似占用，尝试通过自助服务解绑占用设备")
   local state = load_state()
-  local allowed, occ_ip = can_release(target_info, state)
-  if not allowed then
-    log("WARN", "登录疑似占用，但解绑保险未通过，不自动解绑")
-    return false
-  end
-
-  log("WARN", "登录失败疑似占用，解绑设备 " .. occ_ip .. " 后重试一次")
-  local released = release_device(occ_ip)
+  local released, why = try_release(info, state)
+  log("INFO", "占用处理: " .. tostring(why))
   state.last_release = os.time()
   save_state(state)
-  if not released then
-    log("WARN", "解绑接口未成功，仍尝试重试登录一次")
-  end
 
-  ok, msg = login_and_verify()  -- 只重试一次，不循环
+  ok, msg = login_and_verify()  -- 无论解绑结果如何，都重试登录一次
   if ok then
     log("INFO", "解绑后重试登录成功")
     return true

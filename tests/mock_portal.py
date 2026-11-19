@@ -71,6 +71,32 @@ def _jsonp(callback, obj):
     return f"{cb}({json.dumps(obj, separators=(',', ':'))})"
 
 
+def _mock_home():
+    """模拟自助服务 /home 的在线设备表格（真机格式）。"""
+    devices = []
+    if STATE.state == "occupied":
+        # 手机占用：占用者 IP 与本机不同，应被踢
+        devices.append(("9001", "10.99.0.88", "学生办公", "aa:bb:cc:dd:ee:ff"))
+    elif STATE.state == "self_occupied":
+        # 占用者就是本机：不应被踢（own_ip=CLIENT_IP）
+        devices.append(("9002", CLIENT_IP, "学生办公", "00:11:22:33:44:55"))
+    elif STATE.state == "online":
+        devices.append(("9003", CLIENT_IP, "学生办公", "00:11:22:33:44:55"))
+
+    rows = ""
+    for did, ip, product, mac in devices:
+        rows += (f'<tr class="w1" data-key="{did}">'
+                 f'<td>{STATE.username or "testuser"}</td>'
+                 f'<td>{ip}</td>'
+                 f'<td>2026-11-19 18:00:00</td>'
+                 f'<td>{product}</td>'
+                 f'<td><a class="btn btn-danger" href="/home/delete?id={did}&amp;user_mac={mac}" '
+                 f'title="下线">下线</a></td></tr>')
+    return ('<!doctype html><title>home</title>'
+            '<input type="hidden" name="_csrf-8800" value="mock_csrf_token">'
+            '<table><tbody>' + rows + '</tbody></table>')
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -194,6 +220,24 @@ class Handler(BaseHTTPRequestHandler):
                 "ServerFlag": 4294967040,
             }))
 
+        # ===== 自助服务（账密会话，与来源 IP 无关）=====
+        if path == "/site/sso":
+            # data = base64("zh-CN:<user>:<md5(pwd)>")
+            try:
+                raw = base64.b64decode(_first(q, "data")).decode()
+                parts = raw.split(":")
+                md5_ok = len(parts) >= 3 and parts[2] == hashlib.md5(TEST_PASSWORD.encode()).hexdigest()
+            except Exception:
+                md5_ok = False
+            STATE.record("sso_login", ok=md5_ok)
+            if md5_ok:
+                # 真机 SSO 成功后 302 到 /home；这里直接返回 home 页内容
+                return self._send(_mock_home(), "text/html; charset=utf-8")
+            return self._send("<title>login</title>login failed", "text/html; charset=utf-8")
+
+        if path == "/home":
+            return self._send(_mock_home(), "text/html; charset=utf-8")
+
         if path == "/cgi-bin/rad_user_dm":
             # 复刻 Portal.js: sign = sha1(time + username + ip + unbind + time)
             t = _first(q, "time")
@@ -218,12 +262,28 @@ class Handler(BaseHTTPRequestHandler):
         return self._send("not found", "text/plain", 404)
 
     def do_POST(self):
-        if urllib.parse.urlparse(self.path).path != "/cgi-bin/srun_portal":
-            return self._send("not found", "text/plain", 404)
-
+        path = urllib.parse.urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
         form = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8"))
         get = lambda k, d="": form.get(k, [d])[0]
+
+        if path == "/home/delete":
+            # 自助服务下线：真正把占用设备踢掉
+            STATE.dm_count += 1
+            # 记录被踢设备的 IP（按 id 反查 mock 设备表，便于测试断言）
+            kicked_ip = ""
+            if STATE.state == "occupied":
+                kicked_ip = "10.99.0.88"
+            elif STATE.state == "self_occupied":
+                kicked_ip = CLIENT_IP
+            STATE.record("home_delete", id=get("id"), mac=get("user_mac"), ip=kicked_ip)
+            if STATE.state == "occupied":
+                STATE.state = "offline"
+                STATE.challenge = ""
+            return self._send("/home", "text/html; charset=utf-8")
+
+        if path != "/cgi-bin/srun_portal":
+            return self._send("not found", "text/plain", 404)
 
         if get("action") == "logout":
             STATE.state = "offline"

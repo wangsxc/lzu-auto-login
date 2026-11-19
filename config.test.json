@@ -3,6 +3,7 @@
   "password": "test_password_123",
   "domain": "@study",
   "portal_host": "127.0.0.1:8899",
+  "self_service_base": "http://127.0.0.1:8899",
   "ac_id": "2",
   "target_ssids": [],
   "ssid_filter": false,

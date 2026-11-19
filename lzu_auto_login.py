@@ -14,7 +14,8 @@ LZU/iLZU 校园网自动登录脚本（深澜 srun V1.18 协议）
       先判断是否在目标网络，立即跑一次；随后 5 分钟每分钟一次，
       再后 30 分钟每 10 分钟一次，共 9 次后进程退出。
       每轮流程：已认证 -> 验联网；未认证 -> 先直接登录；
-      仅当登录失败且确认是占用，才调 /cgi-bin/rad_user_dm 解绑并重试；
+      仅当登录失败且确认是占用，才用账密 SSO 登录自助服务列出在线设备、
+      踢掉占用者并重试（账密会话与来源 IP 无关，能看到别的设备）；
       服务端返回登录成功不算数，必须本机联网验证通过才算成功。
       解绑前若本机已能联网、冷却未过、或在线设备就是本机，一律拒绝，
       避免"自己把自己占用了又自己解除"的循环。
@@ -67,6 +68,7 @@ RETRY_BACKOFF = _CFG.get("retry_backoff", [300, 900, 3600])  # 失败退避（�
 BOOT_SCHEDULE = _CFG.get("boot_schedule", [0, 60, 60, 60, 60, 60, 600, 600, 600])
 AUTO_RELEASE = bool(_CFG.get("auto_release", True))  # 账号被占用时自动解绑
 RELEASE_COOLDOWN = int(_CFG.get("release_cooldown", 600))  # 两次解绑最小间隔
+SELF_SERVICE_BASE = _CFG.get("self_service_base", "https://login.lzu.edu.cn:8800")  # 自助服务地址（测试可指向 mock）
 INTERNET_PROBE_URLS = _CFG.get("internet_probe_urls", [
     "http://www.baidu.com/",
     "http://captive.apple.com/hotspot-detect.html",
@@ -553,10 +555,14 @@ def verify_internet():
 def _try_release(info, state):
     """仅在登录失败且疑似占用时调用；返回 (是否解绑, 说明)。
 
+    用自助服务账密 SSO（self_service.py）拿到账号下全部在线设备再踢占用者，
+    而不是 rad_user_info —— 后者按来源 IP 判断，未认证时看不到别人的会话。
+    自助服务是账密会话，与来源 IP 无关，任何设备都能踢掉占用者（真机验证）。
+
     三道保险，防止"自己把自己踢下线"再自己解一遍：
       1. 本机当前能联网        -> 绝不解除
       2. 距上次解绑太近        -> 不重复解除
-      3. 在线设备只有本机 IP   -> 绝不解除
+      3. 账密视角下在线设备只有本机 IP -> 绝不解除
     """
     if not AUTO_RELEASE:
         return False, "自动解绑已关闭"
@@ -567,31 +573,18 @@ def _try_release(info, state):
     if RELEASE_COOLDOWN > 0 and time.time() - last < RELEASE_COOLDOWN:
         return False, f"距上次解绑不足 {RELEASE_COOLDOWN}s，跳过"
 
-    own = LAST_CLIENT_IP or ""
-    candidates = []
+    # 账密登录自助服务，拿到全量在线设备（关键：能看到占用者）
     try:
-        detail = json.loads(info.get("online_device_detail") or "{}")
-        for dev in detail.values():
-            ip = dev.get("ip") if isinstance(dev, dict) else ""
-            if ip and ip != own:
-                candidates.append(ip)
-    except Exception:
-        pass
-    if not candidates:
-        ip = info.get("online_ip") or ""
-        if not ip or ip == own:
-            return False, "在线设备就是本机，拒绝自我解绑"
-        candidates = [ip]
+        from self_service import release_occupant
+        own = LAST_CLIENT_IP or ""
+        ok, why = release_occupant(USERNAME, PASSWORD, own_ip=own, base=SELF_SERVICE_BASE,
+                                   log=lambda m: logger.info(f"[自助服务] {m}"))
+    except Exception as e:
+        logger.error(f"自助服务解绑异常: {e}")
+        return False, f"自助服务解绑异常: {e}"
 
-    target = candidates[0]
-    resp, ok = release_device(target)
     state["last_release"] = time.time()
-    if ok:
-        return True, f"已解绑占用设备 {target}"
-    # not_online_error 说明目标本来就已下线，也算达成了目的
-    if resp and "not_online_error" in resp:
-        return True, f"占用设备 {target} 已不在线（无需解绑）"
-    return False, f"解绑失败: {str(resp)[:120]}"
+    return ok, why
 
 
 def _looks_occupied(msg):

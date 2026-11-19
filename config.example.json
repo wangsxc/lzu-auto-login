@@ -11,9 +11,10 @@
   "boot_schedule": [0, 60, 60, 60, 60, 60, 600, 600, 600],
   "auto_release": true,
   "release_cooldown": 600,
+  "self_service_base": "https://login.lzu.edu.cn:8800",
   "internet_probe_urls": ["http://www.baidu.com/", "http://captive.apple.com/hotspot-detect.html"],
   "state_file": ".lzu_state.json",
   "lock_port": 47621,
   "log_file": "lzu_auto_login.log",
-  "_说明": "复制本文件为 config.json 后填写。config.json 已被 .gitignore 排除；可用环境变量 LZU_USERNAME / LZU_PASSWORD 覆盖账密，用 LZU_CONFIG 指定其他配置文件。domain 填 @study 对应 @eLearning（流量不限，断电或长时间离线后需重新认证）；填空字符串对应 @lzu.edu.cn（有记忆但流量有限）。target_ssids 是目标网络，ssid_filter=true 时每轮都判断。boot_schedule 是开机守护间隔序列（秒）：0 立即 1 次，随后 5 次各 60 秒，再 3 次各 600 秒，共 9 次约 35 分钟后进程退出，不常驻。auto_release=true 时，只有【先直接登录失败且响应疑似占用】才会调 /cgi-bin/rad_user_dm 解绑再重试登录（会踢掉其他设备）；解绑前若本机已能联网、距上次解绑不足 release_cooldown、或在线设备只有本机 IP，一律拒绝解绑，防止自己踢自己。internet_probe_urls 用于登录成功后（及解绑前）单次验证本机是否真能上网，被劫持到 Portal 即判为未通；只在成功后调用一次，不做轮询。retry_backoff 是连续失败退避秒数；check_interval 仅用于 --watch 调试。"
+  "_说明": "复制本文件为 config.json 后填写。config.json 已被 .gitignore 排除；可用环境变量 LZU_USERNAME / LZU_PASSWORD 覆盖账密，用 LZU_CONFIG 指定其他配置文件。domain 填 @study 对应 @eLearning（流量不限，断电或长时间离线后需重新认证）；填空字符串对应 @lzu.edu.cn（有记忆但流量有限）。target_ssids 是目标网络，ssid_filter=true 时每轮都判断。boot_schedule 是开机守护间隔序列（秒）：0 立即 1 次，随后 5 次各 60 秒，再 3 次各 600 秒，共 9 次约 35 分钟后进程退出，不常驻。auto_release=true 时，只有【先直接登录失败且响应疑似占用】才会用账密 SSO 登录自助服务（self_service_base，免验证码）列出账号下全部在线设备、踢掉占用者再重试登录（会踢掉其他设备；账密会话与来源 IP 无关，所以能看到并踢掉占用者，这是 rad_user_dm 做不到的）；解绑前若本机已能联网、距上次解绑不足 release_cooldown、或在线设备只有本机 IP，一律拒绝解绑，防止自己踢自己。internet_probe_urls 用于登录成功后（及解绑前）单次验证本机是否真能上网，被劫持到 Portal 即判为未通；只在成功后调用一次，不做轮询。retry_backoff 是连续失败退避秒数；check_interval 仅用于 --watch 调试。"
 }

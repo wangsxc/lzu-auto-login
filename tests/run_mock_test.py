@@ -100,7 +100,8 @@ def main():
         control("occupied")
         code, out = run_client()
         st = http_json("/__state")
-        dm = [h for h in st["history"] if h["event"] == "rad_user_dm"]
+        dm = [h for h in st["history"] if h["event"] == "home_delete"]
+        sso = [h for h in st["history"] if h["event"] == "sso_login"]
         logins = [h for h in st["history"] if h["event"] == "login"]
         ok &= check("退出码 0", code == 0, f"code={code}")
         ok &= check("先尝试直接登录且失败", bool(logins) and any(
@@ -108,10 +109,10 @@ def main():
         ))
         seq = [h["event"] for h in st["history"]]
         first_login = next((i for i, e in enumerate(seq) if e == "login"), -1)
-        first_dm = next((i for i, e in enumerate(seq) if e == "rad_user_dm"), -1)
+        first_dm = next((i for i, e in enumerate(seq) if e == "home_delete"), -1)
         ok &= check("登录失败后才调用解绑", 0 <= first_login < first_dm,
                     f"login@{first_login} dm@{first_dm}")
-        ok &= check("解绑 sign 校验通过", bool(dm) and all(h.get("sign_ok") for h in dm))
+        ok &= check("自助服务账密 SSO 登录成功", bool(sso) and all(h.get("ok") for h in sso))
         ok &= check("解绑的是占用设备 IP", any(h.get("ip") == "10.99.0.88" for h in dm))
         ok &= check("解绑后重新登录成功", any(h["result"] == "login_ok" for h in logins))
         ok &= check("登录成功后联网验证通过", "联网验证通过" in out)
@@ -140,7 +141,7 @@ def main():
         before = http_json("/__state")["dm_count"]
         code, out = run_client()
         after = http_json("/__state")["dm_count"]
-        ok &= check("没有调用 rad_user_dm", after == before, f"dm {before}->{after}")
+        ok &= check("没有下线任何设备", after == before, f"dm {before}->{after}")
         ok &= check("明确判定为拒绝解绑", "拒绝" in out)
         ok &= check("不误报登录成功", code != 0, f"code={code}")
 
